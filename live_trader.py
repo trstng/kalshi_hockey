@@ -241,9 +241,9 @@ class NHLTradingBot:
                     return market
 
             if opponent_abbrev:
-                logger.warning(f"No market found for {team_abbrev} vs {opponent_abbrev} on {date_str}")
+                logger.debug(f"No market found for {team_abbrev} vs {opponent_abbrev} on {date_str}")
             else:
-                logger.warning(f"No market found for {team_abbrev} on {date_str}")
+                logger.debug(f"No market found for {team_abbrev} on {date_str}")
             return None
         except Exception as e:
             logger.error(f"Failed to find market for {team_abbrev}: {e}")
@@ -297,6 +297,13 @@ class NHLTradingBot:
 
             # Calculate poll times
             puck_drop = game.get_puck_drop_timestamp()
+
+            # Skip games that have already started (no point searching for markets)
+            now = int(time.time())
+            if puck_drop < now - 3600:  # Game started more than 1 hour ago
+                logger.debug(f"  Skipping {away_abbrev} @ {home_abbrev} - already started")
+                continue
+
             game.poll_6h = puck_drop - (6 * 3600)
             game.poll_3h = puck_drop - (3 * 3600)
             game.poll_30m = puck_drop - (30 * 60)
