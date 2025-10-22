@@ -154,6 +154,7 @@ class NHLTradingBot:
         # State
         self.games: Dict[str, NHLGame] = {}
         self.positions: Dict[str, Position] = {}
+        self.kalshi_markets_cache: List[dict] = []  # Cache all NHL markets at startup
 
         logger.info("="*80)
         logger.info("NHL TRADING BOT INITIALIZED")
@@ -199,9 +200,22 @@ class NHLTradingBot:
             logger.error(f"Failed to fetch NHL schedule: {e}")
             return []
 
+    def load_kalshi_markets_cache(self):
+        """Fetch all NHL markets once at startup and cache them."""
+        try:
+            logger.info("📥 Fetching all Kalshi NHL markets (one-time)...")
+            self.kalshi_markets_cache = self.client.get_markets(
+                series_ticker='KXNHLGAME',
+                limit=500
+            )
+            logger.info(f"✓ Cached {len(self.kalshi_markets_cache)} NHL markets")
+        except Exception as e:
+            logger.error(f"Failed to cache Kalshi markets: {e}")
+            self.kalshi_markets_cache = []
+
     def find_market_for_team(self, game_date: str, team_abbrev: str, opponent_abbrev: str = None) -> Optional[dict]:
         """
-        Find the Kalshi market for a specific team.
+        Find the Kalshi market for a specific team from cached markets.
 
         Args:
             game_date: Date in YYYY-MM-DD format
@@ -212,20 +226,14 @@ class NHLTradingBot:
             Market dict or None
         """
         try:
-            # Search for KXNHLGAME markets on this date
-            markets = self.client.get_markets(
-                series_ticker='KXNHLGAME',
-                limit=200
-            )
-
             # Convert date format: 2025-10-21 -> 25OCT21
             from datetime import datetime
             dt = datetime.strptime(game_date, '%Y-%m-%d')
             date_str = dt.strftime('%y%b%d').upper()  # e.g., "25OCT21"
 
-            # Filter to markets for this team and date
+            # Search cached markets (NO API CALL)
             # Ticker format: KXNHLGAME-25OCT21EDMOTT-EDM
-            for market in markets:
+            for market in self.kalshi_markets_cache:
                 ticker = market.ticker
                 if date_str in ticker and ticker.endswith(f'-{team_abbrev}'):
                     # If opponent is specified, verify it's in the matchup
@@ -240,10 +248,7 @@ class NHLTradingBot:
 
                     return market
 
-            if opponent_abbrev:
-                logger.debug(f"No market found for {team_abbrev} vs {opponent_abbrev} on {date_str}")
-            else:
-                logger.debug(f"No market found for {team_abbrev} on {date_str}")
+            logger.debug(f"No cached market found for {team_abbrev} vs {opponent_abbrev} on {date_str}")
             return None
         except Exception as e:
             logger.error(f"Failed to find market for {team_abbrev}: {e}")
@@ -915,6 +920,9 @@ class NHLTradingBot:
         logger.info("\n" + "="*80)
         logger.info("STARTING NHL TRADING BOT")
         logger.info("="*80)
+
+        # Cache all Kalshi markets ONCE at startup
+        self.load_kalshi_markets_cache()
 
         # Load today's schedule
         self.load_todays_games()
