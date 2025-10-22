@@ -170,6 +170,86 @@ class KalshiTradingClient:
             logger.error(f"Error getting order status for {order_id}: {e}")
             raise
 
+    def get_fills(self, ticker: Optional[str] = None, order_id: Optional[str] = None, min_ts: Optional[int] = None, max_ts: Optional[int] = None) -> list[dict]:
+        """
+        Get order fills (executed trades).
+
+        Args:
+            ticker: Filter by market ticker
+            order_id: Filter by order ID
+            min_ts: Minimum timestamp (Unix seconds)
+            max_ts: Maximum timestamp (Unix seconds)
+
+        Returns:
+            List of fill dictionaries
+        """
+        try:
+            response = self.portfolio_api.get_fills(
+                ticker=ticker,
+                order_id=order_id,
+                min_ts=min_ts,
+                max_ts=max_ts
+            )
+
+            if hasattr(response, 'fills') and response.fills is not None:
+                fills = []
+                for fill in response.fills:
+                    fills.append({
+                        "order_id": fill.order_id if hasattr(fill, 'order_id') else None,
+                        "ticker": fill.ticker if hasattr(fill, 'ticker') else None,
+                        "side": fill.side if hasattr(fill, 'side') else None,
+                        "action": fill.action if hasattr(fill, 'action') else None,
+                        "count": fill.count if hasattr(fill, 'count') else 0,
+                        "yes_price": fill.yes_price if hasattr(fill, 'yes_price') else None,
+                        "no_price": fill.no_price if hasattr(fill, 'no_price') else None,
+                        "created_time": fill.created_time if hasattr(fill, 'created_time') else None,
+                        "trade_id": fill.trade_id if hasattr(fill, 'trade_id') else None,
+                    })
+                return fills
+            return []
+        except Exception as e:
+            logger.error(f"Error getting fills: {e}")
+            return []
+
+    def get_orders(self, ticker: Optional[str] = None, status: Optional[str] = None) -> list[dict]:
+        """
+        Get all orders (active and recent).
+
+        Args:
+            ticker: Filter by market ticker
+            status: Filter by status (resting, canceled, executed, etc.)
+
+        Returns:
+            List of order dictionaries
+        """
+        try:
+            response = self.portfolio_api.get_orders(
+                ticker=ticker,
+                status=status
+            )
+
+            if hasattr(response, 'orders') and response.orders is not None:
+                orders = []
+                for order in response.orders:
+                    orders.append({
+                        "order_id": order.order_id if hasattr(order, 'order_id') else None,
+                        "ticker": order.ticker if hasattr(order, 'ticker') else None,
+                        "side": order.side if hasattr(order, 'side') else None,
+                        "action": order.action if hasattr(order, 'action') else None,
+                        "count": order.count if hasattr(order, 'count') else 0,
+                        "filled_count": order.filled_count if hasattr(order, 'filled_count') else 0,
+                        "remaining_count": order.remaining_count if hasattr(order, 'remaining_count') else 0,
+                        "yes_price": order.yes_price if hasattr(order, 'yes_price') else None,
+                        "no_price": order.no_price if hasattr(order, 'no_price') else None,
+                        "status": order.status if hasattr(order, 'status') else None,
+                        "created_time": order.created_time if hasattr(order, 'created_time') else None,
+                    })
+                return orders
+            return []
+        except Exception as e:
+            logger.error(f"Error getting orders: {e}")
+            return []
+
     def close(self):
         """Close the client."""
         # Official client handles cleanup automatically

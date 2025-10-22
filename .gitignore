@@ -54,3 +54,4 @@ htmlcov/
 
 # Railway
 .railway/
+# Note: railway.json should NOT be ignored - it's needed for deployment!
