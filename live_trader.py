@@ -227,11 +227,30 @@ class NHLTradingBot:
             return None
 
     def load_todays_games(self):
-        """Load today's NHL games and set up monitoring."""
-        today = datetime.now().strftime('%Y-%m-%d')
-        games = self.fetch_nhl_schedule(today)
+        """Load today's and yesterday's NHL games (to catch early UTC games)."""
+        from datetime import timedelta
 
-        logger.info(f"\nFetched {len(games)} NHL games for {today}")
+        today = datetime.now()
+        yesterday = today - timedelta(days=1)
+
+        # Load both today and yesterday to catch games that span midnight UTC
+        today_str = today.strftime('%Y-%m-%d')
+        yesterday_str = yesterday.strftime('%Y-%m-%d')
+
+        games_today = self.fetch_nhl_schedule(today_str)
+        games_yesterday = self.fetch_nhl_schedule(yesterday_str)
+
+        # Combine and deduplicate
+        all_games = games_yesterday + games_today
+        seen_ids = set()
+        games = []
+        for game in all_games:
+            game_id = str(game.get('id'))
+            if game_id not in seen_ids:
+                seen_ids.add(game_id)
+                games.append(game)
+
+        logger.info(f"\nFetched {len(games)} NHL games (yesterday + today)")
 
         for game_data in games:
             game_id = str(game_data.get('id'))
