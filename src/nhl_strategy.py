@@ -22,7 +22,7 @@ def should_enter_position(
     current_price: float,
     opening_price: float,
     min_favorite_threshold: float = 57.0,
-    max_entry_price: float = 40.0
+    max_entry_price: float = 45.0
 ) -> bool:
     """
     Determine if we should enter a position.
@@ -31,7 +31,7 @@ def should_enter_position(
         current_price: Current market price (YES side, 0-100)
         opening_price: Opening price when market first appeared
         min_favorite_threshold: Minimum opening price to qualify as favorite
-        max_entry_price: Maximum price to enter (inclusive)
+        max_entry_price: Maximum price to enter (below 45 = 44 or less)
 
     Returns:
         True if we should enter, False otherwise
@@ -40,12 +40,8 @@ def should_enter_position(
     if opening_price < min_favorite_threshold:
         return False
 
-    # Current price must be at or below entry threshold
-    if current_price > max_entry_price:
-        return False
-
-    # Skip the 46-50 range (poor performance in backtest)
-    if 46 <= current_price <= 50:
+    # Current price must be below entry threshold (44 or less)
+    if current_price >= max_entry_price:
         return False
 
     return True
@@ -59,10 +55,9 @@ def get_position_size(
     Calculate position size based on entry depth.
 
     Position sizing tiers (from backtest):
-    - 46-50: 0x (skip - already filtered in should_enter_position)
-    - 41-45: 0.5x
-    - 36-40: 1.0x
-    - ≤35: 1.5x
+    - 40-44: 0.5x (shallow dips)
+    - 36-39: 1.0x (medium dips)
+    - ≤35: 1.5x (deep dips - best performance)
 
     Args:
         entry_price: Price at which we're entering (0-100)
@@ -73,10 +68,7 @@ def get_position_size(
     """
     multiplier = float(os.getenv('POSITION_SIZE_MULTIPLIER', '1.0'))
 
-    if entry_price >= 46:
-        # Should never reach here due to should_enter_position filter
-        return 0.0
-    elif entry_price >= 41:
+    if entry_price >= 40:
         # Shallow dip: 0.5x
         return base_position_size * 0.5 * multiplier
     elif entry_price >= 36:
@@ -115,7 +107,10 @@ def should_exit_position(
     time_in_position_minutes: int
 ) -> Tuple[bool, str]:
     """
-    Determine if we should exit a position.
+    Determine if we should exit a position during the 90-minute window.
+
+    This is for in-game monitoring ONLY (puck drop + 90 minutes).
+    All positions are force-closed at the 90-minute mark.
 
     Args:
         entry_price: Price at which we entered
@@ -127,33 +122,32 @@ def should_exit_position(
     """
     exit_min, exit_max = get_exit_targets(entry_price)
 
-    # Check if we've hit target range
+    # Check if we've hit target range - TAKE PROFIT
     if exit_min <= current_price <= exit_max:
-        return (True, f"hit_target_range_{exit_min}-{exit_max}")
+        return (True, f"hit_target_range_{exit_min}-{exit_max}¢")
 
     # If price jumped above our target range, exit immediately
-    # (This means price passed through our target)
     if current_price > exit_max:
-        return (True, f"price_above_target_exiting_at_{current_price}")
+        return (True, f"price_above_target_{current_price}¢")
 
-    # Deep dips: Consider holding to outcome if conditions are right
+    # Deep dips (≤35¢): More patient, let it bounce
     if entry_price <= 35:
-        # If still in 90-minute window, keep monitoring
-        if time_in_position_minutes < 90:
-            # Check if price has recovered significantly (≥40)
-            if current_price >= 40:
-                # Recovered well, take profit
-                return (True, f"deep_dip_recovered_to_{current_price}")
-            # Otherwise keep holding
-            return (False, "deep_dip_monitoring")
-        else:
-            # Past 90 minutes, let it ride to outcome
-            return (False, "deep_dip_holding_to_outcome")
+        # Within 90-min window, hold for bigger bounce
+        if current_price >= 45:
+            # Strong bounce, take profit
+            return (True, f"deep_dip_strong_bounce_{current_price}¢")
+        # Otherwise keep monitoring (will force close at 90min)
+        return (False, "deep_dip_monitoring")
 
-    # For shallow/medium dips, exit after 90 minutes regardless
-    if time_in_position_minutes >= 90:
-        return (True, f"time_limit_exited_at_{current_price}")
+    # Shallow/medium dips (36-44¢): Take quick profits
+    if entry_price >= 36:
+        # If we've recovered back to entry + 3-6¢, exit
+        if current_price >= entry_price + 3:
+            return (True, f"shallow_bounce_{current_price}¢")
+        # Otherwise keep monitoring
+        return (False, "shallow_monitoring")
 
+    # Default: keep monitoring
     return (False, "monitoring")
 
 
@@ -199,10 +193,12 @@ def calculate_expected_value(
 def get_strategy_summary() -> str:
     """Return a summary of the strategy for logging."""
     return """
-NHL Mean Reversion Strategy
----------------------------
-Entry: Favorites (≥57% open) dropping to ≤40%
-Position Sizing: 0.5x (41-45), 1.0x (36-40), 1.5x (≤35)
-Exit: Quick profits for shallow, hold for deep dips
+NHL In-Game Mean Reversion Strategy
+------------------------------------
+Entry: Limit orders at 30min pregame for favorites ≥57%
+       Orders fill if price drops <45¢ during first 90min of game
+Position Sizing: 0.5x (40-44¢), 1.0x (36-39¢), 1.5x (≤35¢)
+Exit: Target bounces within 90-minute window
+      Force close all positions at window close
 Historical: 95% win rate, +7.88¢ avg per trade
 """

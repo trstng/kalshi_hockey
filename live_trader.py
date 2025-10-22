@@ -14,9 +14,9 @@ import logging
 import os
 import time
 import requests
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
 from dotenv import load_dotenv
 
@@ -72,16 +72,31 @@ class NHLGame:
     # Favorite tracking
     favorite_team: Optional[str] = None
     favorite_ticker: Optional[str] = None
+    favorite_opening_price: Optional[float] = None
+
+    # Volume tracking (at 30min checkpoint)
+    volume_30m: Optional[int] = None
+    is_qualified: bool = False  # ≥57% favorite AND ≥50k volume
 
     # Checkpoints (Unix timestamps)
     poll_6h: Optional[int] = None
     poll_3h: Optional[int] = None
     poll_30m: Optional[int] = None
 
+    # Game state
+    game_started: bool = False
+    monitoring_window_end: Optional[int] = None  # Puck drop + 90 minutes
+
     def get_puck_drop_timestamp(self) -> int:
         """Convert start_time_utc to Unix timestamp."""
         dt = datetime.fromisoformat(self.start_time_utc.replace('Z', '+00:00'))
         return int(dt.timestamp())
+
+    def is_in_monitoring_window(self) -> bool:
+        """Check if we're in the 90-minute monitoring window."""
+        if not self.game_started or not self.monitoring_window_end:
+            return False
+        return int(time.time()) < self.monitoring_window_end
 
 
 @dataclass
@@ -109,14 +124,23 @@ class NHLTradingBot:
         """Initialize the trading bot."""
         # Kalshi clients
         self.client = KalshiClient()
-        self.trading_client = KalshiTradingClient()
+
+        # Initialize trading client with API credentials from environment
+        api_key_id = os.getenv('KALSHI_API_KEY_ID')
+        private_key = os.getenv('KALSHI_PRIVATE_KEY')
+
+        if not api_key_id or not private_key:
+            logger.error("KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY must be set in environment")
+            raise ValueError("Missing Kalshi API credentials")
+
+        self.trading_client = KalshiTradingClient(
+            api_key=api_key_id,
+            api_secret=private_key
+        )
 
         # Supabase logger
         try:
-            self.logger = SupabaseLogger(
-                table_name='nhl_positions',
-                snapshot_table='nhl_market_snapshots'
-            )
+            self.logger = SupabaseLogger()
         except Exception as e:
             logger.warning(f"Supabase logger initialization failed: {e}")
             self.logger = None
@@ -181,16 +205,22 @@ class NHLTradingBot:
             # Search for KXNHLGAME markets on this date
             markets = self.client.get_markets(
                 series_ticker='KXNHLGAME',
-                status='open',
                 limit=200
             )
 
+            # Convert date format: 2025-10-21 -> 25OCT21
+            from datetime import datetime
+            dt = datetime.strptime(game_date, '%Y-%m-%d')
+            date_str = dt.strftime('%y%b%d').upper()  # e.g., "25OCT21"
+
             # Filter to markets for this team and date
+            # Ticker format: KXNHLGAME-25OCT21EDMOTT-EDM
             for market in markets:
-                # Ticker format: KXNHLGAME-25OCT21EDMOTT-EDM
-                if team_abbrev in market.ticker and game_date.replace('-', '') in market.ticker:
+                ticker = market.ticker
+                if date_str in ticker and ticker.endswith(f'-{team_abbrev}'):
                     return market
 
+            logger.warning(f"No market found for {team_abbrev} on {date_str}")
             return None
         except Exception as e:
             logger.error(f"Failed to find market for {team_abbrev}: {e}")
@@ -238,7 +268,6 @@ class NHLTradingBot:
             game: NHL game to poll
             checkpoint: '6h', '3h', or '30m'
         """
-        now = int(time.time())
 
         # Find markets for both teams
         away_market = self.find_market_for_team(game.date, game.away_team)
@@ -261,104 +290,124 @@ class NHLTradingBot:
             if away_market.last_price > home_market.last_price:
                 game.favorite_team = game.away_team
                 game.favorite_ticker = away_market.ticker
+                game.favorite_opening_price = away_market.last_price
             else:
                 game.favorite_team = game.home_team
                 game.favorite_ticker = home_market.ticker
+                game.favorite_opening_price = home_market.last_price
 
             logger.info(f"\n[{checkpoint.upper()}] {game.away_team} @ {game.home_team}")
             logger.info(f"  {game.away_team}: {away_market.last_price}%")
             logger.info(f"  {game.home_team}: {home_market.last_price}%")
-            logger.info(f"  Favorite: {game.favorite_team}")
+            logger.info(f"  Favorite: {game.favorite_team} ({game.favorite_opening_price}%)")
 
-        # Check for entry signals on favorite
-        if game.favorite_ticker:
-            self.check_entry_signal(game, checkpoint)
+        # At 30min checkpoint, check qualification and place limit orders
+        elif checkpoint == '30m':
+            if game.favorite_ticker and game.favorite_opening_price:
+                # Check if favorite still qualifies (≥57%)
+                if game.favorite_opening_price >= 57.0:
+                    # TODO: Add volume check here when API access is available
+                    # For now, assume qualified if ≥57%
+                    game.is_qualified = True
+
+                    logger.info(f"\n[{checkpoint.upper()}] {game.away_team} @ {game.home_team}")
+                    logger.info(f"  ✅ QUALIFIED: Favorite {game.favorite_team} @ {game.favorite_opening_price}%")
+                    logger.info(f"  📊 Placing limit orders for in-game dips <45¢")
+
+                    # Place tiered limit orders at different price levels
+                    self.place_tiered_limit_orders(game)
+                else:
+                    logger.info(f"\n[{checkpoint.upper()}] {game.away_team} @ {game.home_team}")
+                    logger.info(f"  ❌ NOT QUALIFIED: Favorite only {game.favorite_opening_price}% (need ≥57%)")
 
         # Check exits on open positions
         self.check_exit_signals(game)
 
-    def check_entry_signal(self, game: NHLGame, checkpoint: str):
-        """Check if we should enter a position on the favorite."""
+    def place_tiered_limit_orders(self, game: NHLGame):
+        """
+        Place tiered limit orders at 30-minute checkpoint.
+        Orders will fill if price drops during the game.
+        """
+        if not game.favorite_ticker:
+            return
+
+        # Check if already have orders placed for this game
         if game.favorite_ticker in self.positions:
-            # Already have a position
+            logger.info(f"  ⚠️  Already have position/orders for {game.favorite_ticker}")
             return
 
-        # Get current market
-        market = self.client.get_market(game.favorite_ticker)
-        if not market:
-            return
-
-        current_price = market.last_price
-        opening_price = (game.away_opening_price if game.favorite_team == game.away_team
-                        else game.home_opening_price)
-
-        # Check strategy entry criteria
-        if not should_enter_position(current_price, opening_price):
-            return
-
-        logger.info(f"\n🎯 ENTRY SIGNAL: {game.favorite_team}")
-        logger.info(f"  Opening: {opening_price}% → Current: {current_price}%")
-
-        # Calculate position size
         base_size = self.bankroll * 0.1  # Base 10% of bankroll per trade
-        position_value = get_position_size(current_price, base_size)
 
-        # Check exposure limits
-        current_exposure = sum(p.position_size for p in self.positions.values())
-        max_exposure = self.bankroll * self.max_exposure_pct
+        # Define price tiers for limit orders (below 45¢)
+        # Tier 1: 40-44¢ (0.5x sizing)
+        # Tier 2: 36-39¢ (1.0x sizing)
+        # Tier 3: ≤35¢ (1.5x sizing)
+        tiers = [
+            {'price': 42, 'label': 'shallow', 'multiplier': 0.5},
+            {'price': 38, 'label': 'medium', 'multiplier': 1.0},
+            {'price': 34, 'label': 'deep', 'multiplier': 1.5},
+        ]
 
-        if current_exposure + position_value > max_exposure:
-            logger.warning(f"  ⚠️  Would exceed max exposure (${max_exposure:,.2f})")
-            return
+        for tier in tiers:
+            price = tier['price']
+            position_value = base_size * tier['multiplier'] * self.position_multiplier
 
-        # Calculate contracts
-        num_contracts = int(position_value / (current_price / 100))
+            # Check exposure limits
+            current_exposure = sum(p.position_size for p in self.positions.values())
+            max_exposure = self.bankroll * self.max_exposure_pct
 
-        # Get exit targets
-        exit_min, exit_max = get_exit_targets(current_price)
+            if current_exposure + position_value > max_exposure:
+                logger.warning(f"  ⚠️  Skipping {tier['label']} tier - would exceed max exposure")
+                continue
 
-        logger.info(f"  Position Size: ${position_value:,.2f} ({num_contracts} contracts)")
-        logger.info(f"  Exit Target: {exit_min}-{exit_max}%")
+            num_contracts = int(position_value / (price / 100))
+            exit_min, exit_max = get_exit_targets(price)
 
-        # Place order
-        order_id = None
-        if not self.dry_run:
-            try:
-                order_id = self.trading_client.place_order(
-                    ticker=game.favorite_ticker,
-                    action='buy',
-                    side='yes',
-                    count=num_contracts,
-                    limit_price=int(current_price)
-                )
-                logger.info(f"  ✅ Order placed: {order_id}")
-            except Exception as e:
-                logger.error(f"  ❌ Order failed: {e}")
-                return
-        else:
-            logger.info(f"  [DRY RUN] Would place order for {num_contracts} contracts")
+            logger.info(f"  📝 {tier['label'].capitalize()} tier: {num_contracts} contracts @ {price}¢ (exit {exit_min}-{exit_max}¢)")
 
-        # Create position
-        position = Position(
-            ticker=game.favorite_ticker,
-            game_id=game.game_id,
-            entry_price=current_price,
-            entry_time=int(time.time()),
-            position_size=position_value,
-            num_contracts=num_contracts,
-            exit_min=exit_min,
-            exit_max=exit_max,
-            order_id=order_id
-        )
+            # Place limit order
+            order_id = None
+            if not self.dry_run:
+                try:
+                    order = self.trading_client.place_order(
+                        ticker=game.favorite_ticker,
+                        action='buy',
+                        side='yes',
+                        count=num_contracts,
+                        price=price,
+                        order_type='limit'
+                    )
+                    order_id = order.order_id
+                    logger.info(f"     ✅ Limit order placed: {order_id}")
+                except Exception as e:
+                    logger.error(f"     ❌ Order failed: {e}")
+                    continue
+            else:
+                logger.info(f"     [DRY RUN] Would place limit order")
 
-        self.positions[game.favorite_ticker] = position
+            # Create position (will be filled when price reaches level)
+            position = Position(
+                ticker=game.favorite_ticker,
+                game_id=game.game_id,
+                entry_price=price,
+                entry_time=int(time.time()),
+                position_size=position_value,
+                num_contracts=num_contracts,
+                exit_min=exit_min,
+                exit_max=exit_max,
+                order_id=order_id
+            )
 
-        # Log to Supabase
-        if self.logger:
-            try:
-                self.logger.log_position(asdict(position))
-            except Exception as e:
-                logger.error(f"Failed to log position to Supabase: {e}")
+            # Use unique key for each tier
+            position_key = f"{game.favorite_ticker}_{price}"
+            self.positions[position_key] = position
+
+            # Log to Supabase
+            if self.logger:
+                try:
+                    self.logger.log_position(asdict(position))
+                except Exception as e:
+                    logger.error(f"Failed to log position to Supabase: {e}")
 
     def check_exit_signals(self, game: NHLGame):
         """Check if we should exit any positions for this game."""
@@ -408,11 +457,60 @@ class NHLTradingBot:
                 # Remove position
                 del self.positions[ticker]
 
+    def force_close_positions(self, game: NHLGame):
+        """Force close all positions for a game at 90-minute window close."""
+        positions_to_close = []
+
+        # Find all positions for this game
+        for position_key, position in list(self.positions.items()):
+            if position.game_id == game.game_id:
+                positions_to_close.append((position_key, position))
+
+        if not positions_to_close:
+            logger.info(f"  No open positions to close")
+            return
+
+        for position_key, position in positions_to_close:
+            # Get current market price
+            market = self.client.get_market(position.ticker)
+            if not market:
+                logger.warning(f"  ⚠️  Could not fetch market for {position.ticker}")
+                continue
+
+            current_price = market.last_price
+            pnl = (current_price - position.entry_price) * position.num_contracts / 100
+
+            logger.info(f"\n  📤 FORCE CLOSING: {position.ticker}")
+            logger.info(f"     Entry: {position.entry_price}¢ → Current: {current_price}¢")
+            logger.info(f"     P&L: ${pnl:.2f}")
+
+            # Place exit order
+            if not self.dry_run and position.order_id:
+                try:
+                    self.trading_client.place_order(
+                        ticker=position.ticker,
+                        action='sell',
+                        side='yes',
+                        count=position.num_contracts,
+                        price=int(current_price),
+                        order_type='limit'
+                    )
+                    logger.info(f"     ✅ Exit order placed")
+                except Exception as e:
+                    logger.error(f"     ❌ Exit order failed: {e}")
+            else:
+                logger.info(f"     [DRY RUN] Would exit position")
+
+            # Remove position
+            del self.positions[position_key]
+
     def run_polling_cycle(self):
         """Run one polling cycle across all games."""
         now = int(time.time())
 
-        for game_id, game in self.games.items():
+        for game in self.games.values():
+            puck_drop = game.get_puck_drop_timestamp()
+
             # Check if it's time for 6hr poll
             if game.poll_6h and abs(now - game.poll_6h) < 300:  # Within 5min
                 self.poll_game_markets(game, '6h')
@@ -427,6 +525,23 @@ class NHLTradingBot:
             elif game.poll_30m and abs(now - game.poll_30m) < 300:
                 self.poll_game_markets(game, '30m')
                 game.poll_30m = None
+
+            # Check if game has started (puck drop)
+            if not game.game_started and now >= puck_drop:
+                game.game_started = True
+                game.monitoring_window_end = puck_drop + (90 * 60)  # 90 minutes
+                logger.info(f"\n🏒 PUCK DROP: {game.away_team} @ {game.home_team}")
+                logger.info(f"  📊 Monitoring window: 90 minutes (until {datetime.fromtimestamp(game.monitoring_window_end).strftime('%H:%M')})")
+
+            # Monitor positions during the 90-minute window
+            if game.game_started and game.is_qualified:
+                if game.is_in_monitoring_window():
+                    # Check exits for this game's positions
+                    self.check_exit_signals(game)
+                elif game.monitoring_window_end and now >= game.monitoring_window_end:
+                    # Force close any remaining positions at window close
+                    logger.info(f"\n⏰ WINDOW CLOSED: {game.away_team} @ {game.home_team}")
+                    self.force_close_positions(game)
 
     def run(self):
         """Main bot loop."""
