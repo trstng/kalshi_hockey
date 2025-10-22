@@ -343,76 +343,19 @@ class NHLTradingBot:
             if home_market:
                 game.home_ticker = home_market.ticker
 
-            # Determine favorite and get current odds
-            away_price = away_market.last_price if away_market else 0
-            home_price = home_market.last_price if home_market else 0
-
-            if away_price > home_price:
-                favorite_ticker = away_market.ticker
-                favorite_price = away_price
-                game.favorite_team = game.away_team
-                game.favorite_ticker = away_market.ticker
-                game.favorite_opening_price = away_price
-            else:
-                favorite_ticker = home_market.ticker
-                favorite_price = home_price
-                game.favorite_team = game.home_team
-                game.favorite_ticker = home_market.ticker
-                game.favorite_opening_price = home_price
-
-            # Log to Supabase with current odds
+            # Just log the game to Supabase - odds will be captured at checkpoints
             try:
-                now = int(time.time())
-                puck_drop = game.get_puck_drop_timestamp()
-                time_until_game = (puck_drop - now) / 3600  # hours until game
-
                 game_log_data = {
-                    'market_ticker': favorite_ticker,
+                    'market_ticker': market.ticker,
                     'event_ticker': market.event_ticker if hasattr(market, 'event_ticker') else None,
                     'market_title': market.title if hasattr(market, 'title') else f"{game.away_team} @ {game.home_team}",
                     'yes_subtitle': market.yes_sub_title if hasattr(market, 'yes_sub_title') else None,
-                    'kickoff_ts': puck_drop,
+                    'kickoff_ts': game.get_puck_drop_timestamp(),
                     'status': 'monitoring'
                 }
 
-                # Add current odds to the appropriate checkpoint field based on time until game
-                current_odds = favorite_price / 100
-                if time_until_game >= 5.5:  # More than 5.5 hours away - log as 6h checkpoint
-                    game_log_data['odds_6h'] = current_odds
-                    game_log_data['checkpoint_6h_ts'] = now
-                    logger.info(f"  ✓ Logged: {game.away_team} @ {game.home_team} ({favorite_ticker}) - {game.favorite_team} @ {favorite_price}% (6h checkpoint)")
-                elif time_until_game >= 2.5:  # 2.5-5.5 hours away - log as 3h checkpoint
-                    game_log_data['odds_3h'] = current_odds
-                    game_log_data['checkpoint_3h_ts'] = now
-                    logger.info(f"  ✓ Logged: {game.away_team} @ {game.home_team} ({favorite_ticker}) - {game.favorite_team} @ {favorite_price}% (3h checkpoint)")
-                elif time_until_game >= 0:  # 0-2.5 hours away - log as 30m checkpoint
-                    game_log_data['odds_30m'] = current_odds
-                    game_log_data['checkpoint_30m_ts'] = now
-                    logger.info(f"  ✓ Logged: {game.away_team} @ {game.home_team} ({favorite_ticker}) - {game.favorite_team} @ {favorite_price}% (30m checkpoint)")
-                else:
-                    # Game already started
-                    logger.info(f"  ✓ Logged: {game.away_team} @ {game.home_team} ({favorite_ticker}) - {game.favorite_team} @ {favorite_price}% (already started)")
-
                 self.logger.log_game(game_log_data)
-
-                # Immediately check eligibility if we have 30m checkpoint data
-                if 'odds_30m' in game_log_data and favorite_price >= 57.0:
-                    game.is_qualified = True
-                    self.logger.update_game_eligibility(
-                        market_ticker=favorite_ticker,
-                        is_eligible=True
-                    )
-                    logger.info(f"     ✅ QUALIFIED for trading (favorite ≥57%)")
-
-                    # If game hasn't started yet, place limit orders now
-                    if time_until_game > 0:
-                        self.place_tiered_limit_orders(game)
-                elif 'odds_30m' in game_log_data:
-                    self.logger.update_game_eligibility(
-                        market_ticker=favorite_ticker,
-                        is_eligible=False
-                    )
-                    logger.info(f"     ❌ NOT QUALIFIED (favorite only {favorite_price}%, need ≥57%)")
+                logger.info(f"  ✓ Logged: {game.away_team} @ {game.home_team} ({market.ticker})")
 
             except Exception as e:
                 logger.error(f"  ✗ Failed to log game {game.away_team} @ {game.home_team}: {e}")
