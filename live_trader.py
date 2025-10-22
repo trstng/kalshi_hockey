@@ -199,13 +199,14 @@ class NHLTradingBot:
             logger.error(f"Failed to fetch NHL schedule: {e}")
             return []
 
-    def find_market_for_team(self, game_date: str, team_abbrev: str) -> Optional[dict]:
+    def find_market_for_team(self, game_date: str, team_abbrev: str, opponent_abbrev: str = None) -> Optional[dict]:
         """
         Find the Kalshi market for a specific team.
 
         Args:
             game_date: Date in YYYY-MM-DD format
             team_abbrev: Team abbreviation (e.g., 'TOR', 'VGK')
+            opponent_abbrev: Opponent team abbreviation (optional, for verification)
 
         Returns:
             Market dict or None
@@ -227,9 +228,22 @@ class NHLTradingBot:
             for market in markets:
                 ticker = market.ticker
                 if date_str in ticker and ticker.endswith(f'-{team_abbrev}'):
+                    # If opponent is specified, verify it's in the matchup
+                    if opponent_abbrev:
+                        # Extract matchup from ticker (e.g., "EDMOTT" from "KXNHLGAME-25OCT21EDMOTT-EDM")
+                        parts = ticker.split('-')
+                        if len(parts) >= 2:
+                            matchup = parts[1][len(date_str):]  # Remove date prefix
+                            # Check if opponent abbreviation is in the matchup
+                            if opponent_abbrev.upper() not in matchup.upper():
+                                continue  # Skip this market, opponent doesn't match
+
                     return market
 
-            logger.warning(f"No market found for {team_abbrev} on {date_str}")
+            if opponent_abbrev:
+                logger.warning(f"No market found for {team_abbrev} vs {opponent_abbrev} on {date_str}")
+            else:
+                logger.warning(f"No market found for {team_abbrev} on {date_str}")
             return None
         except Exception as e:
             logger.error(f"Failed to find market for {team_abbrev}: {e}")
@@ -272,7 +286,7 @@ class NHLTradingBot:
 
             game = NHLGame(
                 game_id=game_id,
-                date=today,
+                date=today_str,  # Store as string, not datetime object
                 start_time_utc=start_time,
                 away_team=away_abbrev,
                 home_team=home_abbrev
@@ -297,9 +311,9 @@ class NHLTradingBot:
         logger.info("\n🔍 Finding markets and logging games to Supabase...")
 
         for game in self.games.values():
-            # Try to find markets for both teams
-            away_market = self.find_market_for_team(game.date.strftime('%Y-%m-%d'), game.away_team)
-            home_market = self.find_market_for_team(game.date.strftime('%Y-%m-%d'), game.home_team)
+            # Try to find markets for both teams (pass opponent to verify matchup)
+            away_market = self.find_market_for_team(game.date, game.away_team, game.home_team)
+            home_market = self.find_market_for_team(game.date, game.home_team, game.away_team)
 
             if not away_market and not home_market:
                 logger.debug(f"  No markets found for {game.away_team} @ {game.home_team}")
@@ -340,9 +354,9 @@ class NHLTradingBot:
             checkpoint: '6h', '3h', or '30m'
         """
 
-        # Find markets for both teams
-        away_market = self.find_market_for_team(game.date, game.away_team)
-        home_market = self.find_market_for_team(game.date, game.home_team)
+        # Find markets for both teams (game.date is already a string in YYYY-MM-DD format)
+        away_market = self.find_market_for_team(game.date, game.away_team, game.home_team)
+        home_market = self.find_market_for_team(game.date, game.home_team, game.away_team)
 
         if not away_market or not home_market:
             logger.warning(f"Markets not found for {game.away_team} @ {game.home_team}")
