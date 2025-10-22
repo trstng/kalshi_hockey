@@ -284,9 +284,12 @@ class NHLTradingBot:
             if not all([game_id, start_time, away_abbrev, home_abbrev]):
                 continue
 
+            # Extract the actual game date from start_time_utc (e.g., "2025-10-23T00:30:00Z" -> "2025-10-23")
+            game_date = start_time.split('T')[0] if 'T' in start_time else today_str
+
             game = NHLGame(
                 game_id=game_id,
-                date=today_str,  # Store as string, not datetime object
+                date=game_date,  # Use actual game date from start_time_utc
                 start_time_utc=start_time,
                 away_team=away_abbrev,
                 home_team=home_abbrev
