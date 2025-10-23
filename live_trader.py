@@ -226,6 +226,20 @@ class NHLTradingBot:
             Market dict or None
         """
         try:
+            # Map NHL API abbreviations to Kalshi ticker abbreviations
+            # NHL API uses 3-letter codes, Kalshi sometimes uses 2-letter codes
+            abbrev_map = {
+                'NJD': 'NJ',   # New Jersey Devils
+                'LAK': 'LA',   # Los Angeles Kings (sometimes)
+                'SJS': 'SJ',   # San Jose Sharks
+                'TBL': 'TB',   # Tampa Bay Lightning (sometimes)
+                'VGK': 'VGK',  # Vegas Golden Knights (keep as-is)
+            }
+
+            # Normalize team abbreviations for Kalshi
+            team_abbrev_kalshi = abbrev_map.get(team_abbrev, team_abbrev)
+            opponent_abbrev_kalshi = abbrev_map.get(opponent_abbrev, opponent_abbrev) if opponent_abbrev else None
+
             # Convert date format: 2025-10-21 -> 25OCT21
             from datetime import datetime
             dt = datetime.strptime(game_date, '%Y-%m-%d')
@@ -235,15 +249,15 @@ class NHLTradingBot:
             # Ticker format: KXNHLGAME-25OCT21EDMOTT-EDM
             for market in self.kalshi_markets_cache:
                 ticker = market.ticker
-                if date_str in ticker and ticker.endswith(f'-{team_abbrev}'):
+                if date_str in ticker and ticker.endswith(f'-{team_abbrev_kalshi}'):
                     # If opponent is specified, verify it's in the matchup
-                    if opponent_abbrev:
+                    if opponent_abbrev_kalshi:
                         # Extract matchup from ticker (e.g., "EDMOTT" from "KXNHLGAME-25OCT21EDMOTT-EDM")
                         parts = ticker.split('-')
                         if len(parts) >= 2:
                             matchup = parts[1][len(date_str):]  # Remove date prefix
                             # Check if opponent abbreviation is in the matchup
-                            if opponent_abbrev.upper() not in matchup.upper():
+                            if opponent_abbrev_kalshi.upper() not in matchup.upper():
                                 continue  # Skip this market, opponent doesn't match
 
                     return market
@@ -289,8 +303,20 @@ class NHLTradingBot:
             if not all([game_id, start_time, away_abbrev, home_abbrev]):
                 continue
 
-            # Extract the actual game date from start_time_utc (e.g., "2025-10-23T00:30:00Z" -> "2025-10-23")
-            game_date = start_time.split('T')[0] if 'T' in start_time else today_str
+            # Convert UTC time to Eastern time to match Kalshi's date convention
+            # Kalshi uses the local date, not UTC date
+            # e.g., "2025-10-23T00:30:00Z" (12:30 AM UTC Oct 23) -> Oct 22 Eastern
+            try:
+                from datetime import datetime
+                dt_utc = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+                # Convert to Eastern (UTC-5 or UTC-4 depending on DST)
+                # Approximate by subtracting 5 hours
+                from datetime import timedelta
+                dt_eastern = dt_utc - timedelta(hours=5)
+                game_date = dt_eastern.strftime('%Y-%m-%d')
+            except:
+                # Fallback to extracting date from UTC string
+                game_date = start_time.split('T')[0] if 'T' in start_time else today_str
 
             game = NHLGame(
                 game_id=game_id,
