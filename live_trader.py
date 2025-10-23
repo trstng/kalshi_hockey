@@ -270,7 +270,7 @@ class NHLTradingBot:
 
     def load_todays_games(self):
         """Load today's and yesterday's NHL games (to catch early UTC games)."""
-        from datetime import timedelta
+        from datetime import datetime, timedelta
 
         today = datetime.now()
         yesterday = today - timedelta(days=1)
@@ -307,11 +307,9 @@ class NHLTradingBot:
             # Kalshi uses the local date, not UTC date
             # e.g., "2025-10-23T00:30:00Z" (12:30 AM UTC Oct 23) -> Oct 22 Eastern
             try:
-                from datetime import datetime
                 dt_utc = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
                 # Convert to Eastern (UTC-5 or UTC-4 depending on DST)
                 # Approximate by subtracting 5 hours
-                from datetime import timedelta
                 dt_eastern = dt_utc - timedelta(hours=5)
                 game_date = dt_eastern.strftime('%Y-%m-%d')
             except:
