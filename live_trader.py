@@ -553,33 +553,29 @@ class NHLTradingBot:
             logger.info(f"  ⚠️  Already have position/orders for {game.favorite_ticker}")
             return
 
-        base_size = self.bankroll * 0.1  # Base 10% of bankroll per trade
+        # Max exposure per game (e.g., $200 for $1000 bankroll at 20%)
+        max_exposure_per_game = self.bankroll * self.max_exposure_pct
 
         # Define price tiers for limit orders (below 45¢)
-        # Tier 1: 40-44¢ (0.5x sizing)
-        # Tier 2: 36-39¢ (1.0x sizing)
-        # Tier 3: ≤35¢ (1.5x sizing)
+        # Tier 1: 40-44¢ (0.5x weight)
+        # Tier 2: 36-39¢ (1.0x weight)
+        # Tier 3: ≤35¢ (1.5x weight)
+        # Total weight: 0.5 + 1.0 + 1.5 = 3.0
         tiers = [
-            {'price': 42, 'label': 'shallow', 'multiplier': 0.5},
-            {'price': 38, 'label': 'medium', 'multiplier': 1.0},
-            {'price': 34, 'label': 'deep', 'multiplier': 1.5},
+            {'price': 42, 'label': 'shallow', 'weight': 0.5},
+            {'price': 38, 'label': 'medium', 'weight': 1.0},
+            {'price': 34, 'label': 'deep', 'weight': 1.5},
         ]
+
+        total_weight = sum(t['weight'] for t in tiers)
 
         for tier in tiers:
             price = tier['price']
-            position_value = base_size * tier['multiplier'] * self.position_multiplier
-
-            # Check exposure limits PER GAME (not total portfolio)
-            # Only count positions for THIS specific game
-            game_exposure = sum(
-                p.position_size for p in self.positions.values()
-                if p.ticker == game.favorite_ticker
-            )
-            max_exposure_per_game = self.bankroll * self.max_exposure_pct
-
-            if game_exposure + position_value > max_exposure_per_game:
-                logger.warning(f"  ⚠️  Skipping {tier['label']} tier - would exceed max exposure for this game")
-                continue
+            # Allocate portion of max exposure based on tier weight
+            # e.g., Tier 1: $200 × (0.5/3.0) = $33.33
+            #       Tier 2: $200 × (1.0/3.0) = $66.67
+            #       Tier 3: $200 × (1.5/3.0) = $100.00
+            position_value = (max_exposure_per_game * tier['weight'] / total_weight) * self.position_multiplier
 
             num_contracts = int(position_value / (price / 100))
             exit_min, exit_max = get_exit_targets(price)
