@@ -569,12 +569,16 @@ class NHLTradingBot:
             price = tier['price']
             position_value = base_size * tier['multiplier'] * self.position_multiplier
 
-            # Check exposure limits
-            current_exposure = sum(p.position_size for p in self.positions.values())
-            max_exposure = self.bankroll * self.max_exposure_pct
+            # Check exposure limits PER GAME (not total portfolio)
+            # Only count positions for THIS specific game
+            game_exposure = sum(
+                p.position_size for p in self.positions.values()
+                if p.ticker == game.favorite_ticker
+            )
+            max_exposure_per_game = self.bankroll * self.max_exposure_pct
 
-            if current_exposure + position_value > max_exposure:
-                logger.warning(f"  ⚠️  Skipping {tier['label']} tier - would exceed max exposure")
+            if game_exposure + position_value > max_exposure_per_game:
+                logger.warning(f"  ⚠️  Skipping {tier['label']} tier - would exceed max exposure for this game")
                 continue
 
             num_contracts = int(position_value / (price / 100))
