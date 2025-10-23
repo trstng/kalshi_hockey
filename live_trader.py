@@ -587,7 +587,7 @@ class NHLTradingBot:
             if not self.dry_run:
                 try:
                     order = self.trading_client.place_order(
-                        ticker=game.favorite_ticker,
+                        market_ticker=game.favorite_ticker,
                         action='buy',
                         side='yes',
                         count=num_contracts,
