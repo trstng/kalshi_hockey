@@ -358,54 +358,58 @@ class NHLTradingBot:
                 logger.debug(f"  No markets found for {game.away_team} @ {game.home_team}")
                 continue
 
-            # Use the market we found (prefer home team market for consistency)
-            market = home_market if home_market else away_market
-
             # Store market tickers
             if away_market:
                 game.away_ticker = away_market.ticker
             if home_market:
                 game.home_ticker = home_market.ticker
 
-            # Log the game to Supabase
+            # Determine favorite BEFORE logging (so we log with correct ticker)
+            if away_market and home_market:
+                if away_market.last_price > home_market.last_price:
+                    game.favorite_team = game.away_team
+                    game.favorite_ticker = away_market.ticker
+                    game.favorite_opening_price = away_market.last_price
+                    favorite_market = away_market
+                else:
+                    game.favorite_team = game.home_team
+                    game.favorite_ticker = home_market.ticker
+                    game.favorite_opening_price = home_market.last_price
+                    favorite_market = home_market
+            else:
+                # Only one market found, use it
+                favorite_market = away_market if away_market else home_market
+                game.favorite_ticker = favorite_market.ticker
+
+            # Log the game to Supabase using the FAVORITE's ticker (consistency)
             try:
                 game_log_data = {
-                    'market_ticker': market.ticker,
-                    'event_ticker': market.event_ticker if hasattr(market, 'event_ticker') else None,
-                    'market_title': market.title if hasattr(market, 'title') else f"{game.away_team} @ {game.home_team}",
-                    'yes_subtitle': market.yes_sub_title if hasattr(market, 'yes_sub_title') else None,
+                    'market_ticker': game.favorite_ticker,
+                    'event_ticker': favorite_market.event_ticker if hasattr(favorite_market, 'event_ticker') else None,
+                    'market_title': favorite_market.title if hasattr(favorite_market, 'title') else f"{game.away_team} @ {game.home_team}",
+                    'yes_subtitle': favorite_market.yes_sub_title if hasattr(favorite_market, 'yes_sub_title') else None,
                     'kickoff_ts': game.get_puck_drop_timestamp(),
                     'status': 'monitoring'
                 }
 
                 self.logger.log_game(game_log_data)
-                logger.info(f"  ✓ Logged: {game.away_team} @ {game.home_team} ({market.ticker})")
+                logger.info(f"  ✓ Logged: {game.away_team} @ {game.home_team} ({game.favorite_ticker})")
 
                 # If checkpoints have already passed, capture odds immediately
                 now = int(time.time())
 
                 # Capture 6h odds if that checkpoint is in the past
-                if game.poll_6h and game.poll_6h < now:
-                    if away_market and home_market:
-                        # Determine favorite based on current prices
-                        if away_market.last_price > home_market.last_price:
-                            game.favorite_team = game.away_team
-                            game.favorite_ticker = away_market.ticker
-                            game.favorite_opening_price = away_market.last_price
-                        else:
-                            game.favorite_team = game.home_team
-                            game.favorite_ticker = home_market.ticker
-                            game.favorite_opening_price = home_market.last_price
-
-                        # Log to Supabase
-                        self.logger.update_game_checkpoint(
-                            market_ticker=game.favorite_ticker,
-                            field_name='odds_6h',
-                            odds=game.favorite_opening_price / 100,
-                            timestamp=now
-                        )
-                        logger.info(f"    Captured 6h odds (retroactive): {game.favorite_team} @ {game.favorite_opening_price}%")
-                        game.poll_6h = None  # Mark as captured
+                # (Favorite already determined above)
+                if game.poll_6h and game.poll_6h < now and game.favorite_ticker:
+                    # Log to Supabase
+                    self.logger.update_game_checkpoint(
+                        market_ticker=game.favorite_ticker,
+                        field_name='odds_6h',
+                        odds=game.favorite_opening_price / 100,
+                        timestamp=now
+                    )
+                    logger.info(f"    Captured 6h odds (retroactive): {game.favorite_team} @ {game.favorite_opening_price}%")
+                    game.poll_6h = None  # Mark as captured
 
                 # Capture 3h odds if that checkpoint is in the past
                 if game.poll_3h and game.poll_3h < now and game.favorite_ticker:
