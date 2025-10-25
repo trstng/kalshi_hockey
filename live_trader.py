@@ -933,11 +933,21 @@ class NHLTradingBot:
         # Load today's schedule
         self.load_todays_games()
 
+        # Track last reload date
+        last_reload_date = datetime.now().date()
+
         # Main loop
         poll_interval = 60  # Check every minute
 
         while True:
             try:
+                # Check if we need to reload games for new day (at midnight)
+                current_date = datetime.now().date()
+                if current_date > last_reload_date:
+                    logger.info(f"\n📅 NEW DAY: Reloading games for {current_date}")
+                    self.load_todays_games()
+                    last_reload_date = current_date
+
                 self.run_polling_cycle()
                 time.sleep(poll_interval)
             except KeyboardInterrupt:
