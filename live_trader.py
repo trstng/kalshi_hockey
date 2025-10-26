@@ -111,6 +111,7 @@ class Position:
     exit_min: float
     exit_max: float
     order_id: Optional[str] = None
+    exit_order_id: Optional[str] = None  # Exit order placed via measured move
 
     def time_in_position_minutes(self) -> int:
         """Calculate how long we've been in this position."""
@@ -150,6 +151,7 @@ class NHLTradingBot:
         self.max_exposure_pct = float(os.getenv('MAX_EXPOSURE_PCT', 0.5))
         self.dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
         self.position_multiplier = float(os.getenv('POSITION_SIZE_MULTIPLIER', 1.0))
+        self.revert_fraction = float(os.getenv('REVERT_FRACTION', 0.50))  # Measured move exit fraction
 
         # State
         self.games: Dict[str, NHLGame] = {}
@@ -163,6 +165,7 @@ class NHLTradingBot:
         logger.info(f"Max Exposure: {self.max_exposure_pct:.0%}")
         logger.info(f"Dry Run: {self.dry_run}")
         logger.info(f"Position Multiplier: {self.position_multiplier}x")
+        logger.info(f"Revert Fraction: {self.revert_fraction:.0%}")
         logger.info(get_strategy_summary())
 
         # Log initial bankroll to Supabase
@@ -634,6 +637,59 @@ class NHLTradingBot:
             position_key = f"{game.favorite_ticker}_{price}"
             self.positions[position_key] = position
 
+    def _place_exit_order(self, position: Position, game: NHLGame):
+        """
+        Place exit order using measured move strategy.
+        Exit price = entry + (favorite_opening - entry) × revert_fraction
+
+        Args:
+            position: The position to place exit order for
+            game: The game associated with this position
+        """
+        if not game.favorite_opening_price:
+            logger.warning(f"  ⚠️  No favorite opening price available for {position.ticker}, cannot calculate exit price")
+            return
+
+        # Measured move formula: expect partial revert of the total drop
+        # Example: pregame 65¢, entry 45¢, revert 50% → exit = 45¢ + (65¢ - 45¢) × 50% = 55¢
+        pregame_cents = int(game.favorite_opening_price)
+        entry_cents = int(position.entry_price)
+        drop_cents = pregame_cents - entry_cents
+        expected_revert_cents = int(drop_cents * self.revert_fraction)
+        exit_price_cents = entry_cents + expected_revert_cents
+
+        logger.info(f"  → Placing measured move exit: {position.num_contracts} contracts @ {exit_price_cents}¢")
+        logger.info(f"     Formula: {entry_cents}¢ entry + {expected_revert_cents}¢ revert ({self.revert_fraction:.0%} of {drop_cents}¢ drop)")
+
+        if self.dry_run:
+            logger.info(f"    [DRY RUN] Would place exit order")
+            position.exit_order_id = f"dry_run_exit_{position.order_id}"
+            return
+
+        try:
+            exit_order = self.trading_client.place_order(
+                market_ticker=position.ticker,
+                side='yes',
+                action='sell',
+                count=position.num_contracts,
+                price=exit_price_cents,
+                order_type='limit'
+            )
+            position.exit_order_id = exit_order.order_id
+            logger.info(f"    ✅ Exit order placed: {exit_order.order_id}")
+
+            # Log exit order to Supabase
+            if self.logger:
+                self.logger.log_order(
+                    market_ticker=position.ticker,
+                    order_id=exit_order.order_id,
+                    price=exit_price_cents,
+                    size=position.num_contracts,
+                    side='sell'
+                )
+        except Exception as e:
+            logger.error(f"    ❌ Error placing exit order: {e}")
+
     def monitor_order_fills(self):
         """
         Monitor pending orders for fills and update positions accordingly.
@@ -696,6 +752,13 @@ class NHLTradingBot:
                             description=f"Opened position: {total_filled} contracts @ {avg_fill_price}¢"
                         )
 
+                        # IMMEDIATELY place exit order using measured move strategy
+                        game = self.games.get(position.game_id)
+                        if game:
+                            self._place_exit_order(position, game)
+                        else:
+                            logger.warning(f"  ⚠️  Game {position.game_id} not found, cannot place exit order")
+
                     else:
                         # Order was cancelled
                         logger.info(f"⚠️  Order {position.order_id} cancelled/expired")
@@ -721,6 +784,89 @@ class NHLTradingBot:
 
             except Exception as e:
                 logger.error(f"Error monitoring order {position.order_id}: {e}")
+
+    def monitor_exit_order_fills(self):
+        """
+        Monitor pending exit orders for fills and close positions accordingly.
+        This should be called regularly during the trading window.
+        """
+        if self.dry_run or not self.logger:
+            return
+
+        for position_key, position in list(self.positions.items()):
+            # Skip positions without exit orders
+            if not position.exit_order_id:
+                continue
+
+            try:
+                # Check exit order status with Kalshi
+                order_status = self.trading_client.get_order_status(position.exit_order_id)
+
+                # If order returns None, it's been executed/cancelled
+                if order_status is None:
+                    # Check fills to see if it executed
+                    fills = self.trading_client.get_fills(order_id=position.exit_order_id)
+
+                    if fills:
+                        # Exit order filled! Calculate P&L and close position
+                        total_filled = sum(fill['count'] for fill in fills)
+                        avg_exit_price = sum(fill['yes_price'] or fill['no_price'] or 0 for fill in fills) / len(fills) if fills else position.entry_price
+
+                        pnl = ((avg_exit_price - position.entry_price) / 100) * total_filled
+
+                        logger.info(f"\n✅ EXIT ORDER FILLED: {position.exit_order_id}")
+                        logger.info(f"   {total_filled} contracts @ {avg_exit_price}¢")
+                        logger.info(f"   Entry: {position.entry_price}¢ → Exit: {avg_exit_price}¢")
+                        logger.info(f"   P&L: ${pnl:+.2f}")
+
+                        # Update order status in Supabase
+                        self.logger.update_order_status(
+                            order_id=position.exit_order_id,
+                            status='filled',
+                            filled_size=total_filled
+                        )
+
+                        # Log position exit to Supabase
+                        self.logger.log_position_exit(
+                            market_ticker=position.ticker,
+                            exit_price=int(avg_exit_price),
+                            exit_time=int(time.time()),
+                            pnl=pnl
+                        )
+
+                        # Log bankroll change
+                        proceeds = (avg_exit_price / 100) * total_filled
+                        self.bankroll += proceeds
+                        self.logger.log_bankroll_change(
+                            timestamp=int(time.time()),
+                            new_amount=self.bankroll,
+                            change=proceeds,
+                            description=f"Closed position: {total_filled} contracts @ {avg_exit_price}¢ (P&L: ${pnl:+.2f})"
+                        )
+
+                        # Remove position from tracking
+                        del self.positions[position_key]
+
+                    else:
+                        # Exit order was cancelled
+                        logger.info(f"⚠️  Exit order {position.exit_order_id} cancelled/expired")
+                        position.exit_order_id = None  # Clear cancelled exit order
+
+                elif order_status and 'order' in order_status:
+                    order = order_status['order']
+                    filled_count = order.get('filled_count', 0)
+
+                    # Check for partial fills on exit
+                    if filled_count > 0 and filled_count < order.get('count', 0):
+                        logger.info(f"📊 Partial exit: {position.exit_order_id} - {filled_count}/{order.get('count')} filled")
+                        self.logger.update_order_status(
+                            order_id=position.exit_order_id,
+                            status='partially_filled',
+                            filled_size=filled_count
+                        )
+
+            except Exception as e:
+                logger.error(f"Error monitoring exit order {position.exit_order_id}: {e}")
 
     def check_exit_signals(self, game: NHLGame):
         """Check if we should exit any positions for this game."""
@@ -886,6 +1032,8 @@ class NHLTradingBot:
         # Monitor order fills periodically (even if game hasn't started)
         if not self.dry_run:
             self.monitor_order_fills()
+            # Also monitor exit order fills
+            self.monitor_exit_order_fills()
 
         for game in self.games.values():
             puck_drop = game.get_puck_drop_timestamp()
