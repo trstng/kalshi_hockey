@@ -564,14 +564,16 @@ class NHLTradingBot:
         max_exposure_per_game = self.bankroll * self.max_exposure_pct
 
         # Define price tiers for limit orders (below 45¢)
-        # Tier 1: 40-44¢ (0.5x weight)
-        # Tier 2: 36-39¢ (1.0x weight)
-        # Tier 3: ≤35¢ (1.5x weight)
-        # Total weight: 0.5 + 1.0 + 1.5 = 3.0
+        # Tier 1: 42¢ (0.25x weight)
+        # Tier 2: 38¢ (1.0x weight)
+        # Tier 3: 34¢ (2.0x weight)
+        # Tier 4: 32¢ (2.5x weight)
+        # Total weight: 0.25 + 1.0 + 2.0 + 2.5 = 5.75
         tiers = [
-            {'price': 42, 'label': 'shallow', 'weight': 0.5},
+            {'price': 42, 'label': 'shallow', 'weight': 0.25},
             {'price': 38, 'label': 'medium', 'weight': 1.0},
-            {'price': 34, 'label': 'deep', 'weight': 1.5},
+            {'price': 34, 'label': 'deep', 'weight': 2.0},
+            {'price': 32, 'label': 'very_deep', 'weight': 2.5},
         ]
 
         total_weight = sum(t['weight'] for t in tiers)
