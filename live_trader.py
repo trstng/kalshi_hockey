@@ -813,37 +813,9 @@ class NHLTradingBot:
                         # Update position with actual fill count
                         position.num_contracts = count
 
-                        # IMMEDIATELY place exit order at stored target
-                        if not self.dry_run:
-                            try:
-                                exit_order = self.trading_client.place_order(
-                                    market_ticker=position.ticker,
-                                    side='yes',
-                                    action='sell',
-                                    count=count,
-                                    price=target_cents,
-                                    order_type='limit'
-                                )
-                                position.exit_order_id = exit_order.order_id
-                                logger.info(f"✓ Exit order placed: {count} contracts @ {target_cents}¢ (measured-move target)")
-
-                                # Optional: log exit order to Supabase
-                                if self.logger:
-                                    try:
-                                        self.logger.log_order(
-                                            market_ticker=position.ticker,
-                                            order_id=exit_order.order_id,
-                                            price=target_cents,
-                                            size=count,
-                                            side='sell'
-                                        )
-                                    except Exception as e:
-                                        logger.debug(f"Supabase log failed: {e}")
-
-                            except Exception as e:
-                                logger.error(f"❌ Error placing exit order: {e}")
-                        else:
-                            logger.info(f"[DRY RUN] Would place exit: {count} @ {target_cents}¢")
+                        # SELL LOGIC DISABLED - DO NOT PLACE EXIT ORDERS AUTOMATICALLY
+                        logger.info(f"ℹ️  Position opened - exit orders DISABLED (manual exit required)")
+                        logger.info(f"   Target would be: {target_cents}¢ (not placing automatically)")
 
                 elif status == 'pending' and filled_count > 0 and filled_count < order.get('count', 0):
                     # Partial fill
