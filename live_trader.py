@@ -110,6 +110,7 @@ class Position:
     num_contracts: int
     exit_min: float
     exit_max: float
+    exit_target: int  # Measured-move exit price (computed once at entry)
     order_id: Optional[str] = None
     exit_order_id: Optional[str] = None  # Exit order placed via measured move
 
@@ -587,9 +588,25 @@ class NHLTradingBot:
             position_value = (max_exposure_per_game * tier['weight'] / total_weight) * self.position_multiplier
 
             num_contracts = int(position_value / (price / 100))
+
+            # Skip zero-contract orders
+            if num_contracts < 1:
+                logger.info(f"  Skipping {tier['label']} tier @ {price}¢ (size=0)")
+                continue
+
             exit_min, exit_max = get_exit_targets(price)
 
-            logger.info(f"  📝 {tier['label'].capitalize()} tier: {num_contracts} contracts @ {price}¢ (exit {exit_min}-{exit_max}¢)")
+            # Compute measured-move exit target ONCE at position creation
+            # Get opening odds (from 6h checkpoint, or fallback to 65¢)
+            opening_price = game.favorite_opening_price if game.favorite_opening_price else 65
+
+            # Calculate measured-move exit target
+            drop_cents = opening_price - price  # how far it dropped from open
+            revert_cents = int(drop_cents * self.revert_fraction)  # expect partial revert
+            exit_target = price + revert_cents
+            exit_target = max(1, min(99, exit_target))  # clamp to valid range
+
+            logger.info(f"  📝 {tier['label'].capitalize()} tier: {num_contracts} contracts @ {price}¢ (exit target: {exit_target}¢)")
 
             # Place limit order
             order_id = None
@@ -632,6 +649,7 @@ class NHLTradingBot:
                 num_contracts=num_contracts,
                 exit_min=exit_min,
                 exit_max=exit_max,
+                exit_target=exit_target,  # Store computed target
                 order_id=order_id
             )
 
@@ -697,92 +715,148 @@ class NHLTradingBot:
         Monitor pending orders for fills and update positions accordingly.
         This should be called regularly during the trading window.
         """
-        if self.dry_run or not self.logger:
-            return
+        # NO KILL SWITCH - monitoring always runs
 
-        # Get all pending orders from Supabase
         for position_key, position in list(self.positions.items()):
-            if not position.order_id:
-                continue
+            if not position.order_id or position.exit_order_id:
+                continue  # Skip if no pending buy order, or exit already placed
 
             try:
                 # Check order status with Kalshi
                 order_status = self.trading_client.get_order_status(position.order_id)
 
-                # If order returns None, it's been executed/cancelled
+                # Handle "executed but filled_count=0" (Kalshi quirk)
+                order = (order_status or {}).get('order', {})
+                status = order.get('status', 'pending')
+                filled_count = order.get('filled_count', 0)
+
+                # Special handling for "executed" status with 0 filled_count
+                if status == 'executed' and filled_count == 0:
+                    # Try to get fills from API
+                    fills = self.trading_client.get_fills(order_id=position.order_id) or []
+                    filled_count = sum(f.get('count', 0) for f in fills)
+
+                    # Update position entry price from actual fills
+                    if filled_count > 0 and fills:
+                        got_prices = [p for f in fills
+                                     for p in [f.get('yes_price'), f.get('no_price')]
+                                     if p is not None]
+                        if got_prices:
+                            position.entry_price = int(round(sum(got_prices)/len(got_prices)))
+
+                # If order returns None (404), query fills to confirm execution
                 if order_status is None:
-                    # Check fills to see if it executed
                     fills = self.trading_client.get_fills(order_id=position.order_id)
-
                     if fills:
-                        # Order filled! Update our records
-                        total_filled = sum(fill['count'] for fill in fills)
-                        avg_fill_price = sum(fill['yes_price'] or fill['no_price'] or 0 for fill in fills) / len(fills) if fills else position.entry_price
-
-                        logger.info(f"\n✅ ORDER FILLED: {position.order_id}")
-                        logger.info(f"   {total_filled} contracts @ {avg_fill_price}¢")
-
-                        # Update order status in Supabase
-                        self.logger.update_order_status(
-                            order_id=position.order_id,
-                            status='filled',
-                            filled_size=total_filled
-                        )
-
-                        # Log position entry to Supabase
-                        position_data = {
-                            'market_ticker': position.ticker,
-                            'entry_price': int(avg_fill_price),
-                            'size': total_filled,
-                            'entry_time': int(time.time()),
-                            'order_id': position.order_id,
-                            'status': 'open'
-                        }
-                        self.logger.log_position_entry(position_data)
-
-                        # Update position with actual fill data
-                        position.entry_price = avg_fill_price
-                        position.num_contracts = total_filled
-
-                        # Log bankroll change
-                        cost = (avg_fill_price / 100) * total_filled
-                        self.bankroll -= cost
-                        self.logger.log_bankroll_change(
-                            timestamp=int(time.time()),
-                            new_amount=self.bankroll,
-                            change=-cost,
-                            description=f"Opened position: {total_filled} contracts @ {avg_fill_price}¢"
-                        )
-
-                        # IMMEDIATELY place exit order using measured move strategy
-                        game = self.games.get(position.game_id)
-                        if game:
-                            self._place_exit_order(position, game)
-                        else:
-                            logger.warning(f"  ⚠️  Game {position.game_id} not found, cannot place exit order")
-
+                        filled_count = sum(fill.get('count', 0) for fill in fills)
+                        # Get average fill price
+                        got_prices = [p for f in fills
+                                     for p in [f.get('yes_price'), f.get('no_price')]
+                                     if p is not None]
+                        if got_prices:
+                            position.entry_price = int(round(sum(got_prices)/len(got_prices)))
+                        status = 'filled'
                     else:
                         # Order was cancelled
                         logger.info(f"⚠️  Order {position.order_id} cancelled/expired")
-                        self.logger.update_order_status(
-                            order_id=position.order_id,
-                            status='cancelled'
-                        )
+                        if self.logger:
+                            self.logger.update_order_status(
+                                order_id=position.order_id,
+                                status='cancelled'
+                            )
                         # Remove from tracking
                         del self.positions[position_key]
+                        continue
 
-                elif order_status and 'order' in order_status:
-                    order = order_status['order']
-                    filled_count = order.get('filled_count', 0)
+                # If filled, place exit NOW using stored measured-move target
+                if (status in ('filled', 'executed') or filled_count > 0) and not position.exit_order_id:
+                    # Use precomputed measured-move target (already set at position creation)
+                    target_cents = position.exit_target
+                    count = filled_count or position.num_contracts
 
-                    # Check for partial fills
-                    if filled_count > 0 and filled_count < order.get('count', 0):
-                        logger.info(f"📊 Partial fill: {position.order_id} - {filled_count}/{order.get('count')} filled")
-                        self.logger.update_order_status(
-                            order_id=position.order_id,
-                            status='partially_filled',
-                            filled_size=filled_count
-                        )
+                    if count > 0:
+                        logger.info(f"\n✅ ORDER FILLED: {position.order_id}")
+                        logger.info(f"   {count} contracts @ {int(position.entry_price)}¢")
+
+                        # Update order status in Supabase (optional)
+                        if self.logger:
+                            try:
+                                self.logger.update_order_status(
+                                    order_id=position.order_id,
+                                    status='filled',
+                                    filled_size=count
+                                )
+
+                                # Log position entry
+                                position_data = {
+                                    'market_ticker': position.ticker,
+                                    'entry_price': int(position.entry_price),
+                                    'size': count,
+                                    'entry_time': int(time.time()),
+                                    'order_id': position.order_id,
+                                    'status': 'open'
+                                }
+                                self.logger.log_position_entry(position_data)
+
+                                # Log bankroll change
+                                cost = (position.entry_price / 100) * count
+                                self.bankroll -= cost
+                                self.logger.log_bankroll_change(
+                                    timestamp=int(time.time()),
+                                    new_amount=self.bankroll,
+                                    change=-cost,
+                                    description=f"Opened position: {count} contracts @ {int(position.entry_price)}¢"
+                                )
+                            except Exception as e:
+                                logger.debug(f"Supabase logging failed (non-critical): {e}")
+
+                        # Update position with actual fill count
+                        position.num_contracts = count
+
+                        # IMMEDIATELY place exit order at stored target
+                        if not self.dry_run:
+                            try:
+                                exit_order = self.trading_client.place_order(
+                                    market_ticker=position.ticker,
+                                    side='yes',
+                                    action='sell',
+                                    count=count,
+                                    price=target_cents,
+                                    order_type='limit'
+                                )
+                                position.exit_order_id = exit_order.order_id
+                                logger.info(f"✓ Exit order placed: {count} contracts @ {target_cents}¢ (measured-move target)")
+
+                                # Optional: log exit order to Supabase
+                                if self.logger:
+                                    try:
+                                        self.logger.log_order(
+                                            market_ticker=position.ticker,
+                                            order_id=exit_order.order_id,
+                                            price=target_cents,
+                                            size=count,
+                                            side='sell'
+                                        )
+                                    except Exception as e:
+                                        logger.debug(f"Supabase log failed: {e}")
+
+                            except Exception as e:
+                                logger.error(f"❌ Error placing exit order: {e}")
+                        else:
+                            logger.info(f"[DRY RUN] Would place exit: {count} @ {target_cents}¢")
+
+                elif status == 'pending' and filled_count > 0 and filled_count < order.get('count', 0):
+                    # Partial fill
+                    logger.info(f"📊 Partial fill: {position.order_id} - {filled_count}/{order.get('count')} filled")
+                    if self.logger:
+                        try:
+                            self.logger.update_order_status(
+                                order_id=position.order_id,
+                                status='partially_filled',
+                                filled_size=filled_count
+                            )
+                        except Exception as e:
+                            logger.debug(f"Supabase log failed: {e}")
 
             except Exception as e:
                 logger.error(f"Error monitoring order {position.order_id}: {e}")
@@ -792,8 +866,7 @@ class NHLTradingBot:
         Monitor pending exit orders for fills and close positions accordingly.
         This should be called regularly during the trading window.
         """
-        if self.dry_run or not self.logger:
-            return
+        # NO KILL SWITCH - monitoring always runs
 
         for position_key, position in list(self.positions.items()):
             # Skip positions without exit orders
@@ -803,48 +876,57 @@ class NHLTradingBot:
             try:
                 # Check exit order status with Kalshi
                 order_status = self.trading_client.get_order_status(position.exit_order_id)
+                order = (order_status or {}).get('order', {})
+                status = order.get('status', 'pending')
 
-                # If order returns None, it's been executed/cancelled
-                if order_status is None:
+                # If order returns None (404) or status is filled/executed
+                if order_status is None or status in ('filled', 'executed'):
                     # Check fills to see if it executed
                     fills = self.trading_client.get_fills(order_id=position.exit_order_id)
 
                     if fills:
                         # Exit order filled! Calculate P&L and close position
-                        total_filled = sum(fill['count'] for fill in fills)
-                        avg_exit_price = sum(fill['yes_price'] or fill['no_price'] or 0 for fill in fills) / len(fills) if fills else position.entry_price
+                        total_filled = sum(fill.get('count', 0) for fill in fills)
+                        got_prices = [p for f in fills
+                                     for p in [f.get('yes_price'), f.get('no_price')]
+                                     if p is not None]
+                        avg_exit_price = sum(got_prices) / len(got_prices) if got_prices else position.entry_price
 
                         pnl = ((avg_exit_price - position.entry_price) / 100) * total_filled
 
                         logger.info(f"\n✅ EXIT ORDER FILLED: {position.exit_order_id}")
-                        logger.info(f"   {total_filled} contracts @ {avg_exit_price}¢")
-                        logger.info(f"   Entry: {position.entry_price}¢ → Exit: {avg_exit_price}¢")
+                        logger.info(f"   {total_filled} contracts @ {int(avg_exit_price)}¢")
+                        logger.info(f"   Entry: {int(position.entry_price)}¢ → Exit: {int(avg_exit_price)}¢")
                         logger.info(f"   P&L: ${pnl:+.2f}")
 
-                        # Update order status in Supabase
-                        self.logger.update_order_status(
-                            order_id=position.exit_order_id,
-                            status='filled',
-                            filled_size=total_filled
-                        )
+                        # Update Supabase (optional)
+                        if self.logger:
+                            try:
+                                self.logger.update_order_status(
+                                    order_id=position.exit_order_id,
+                                    status='filled',
+                                    filled_size=total_filled
+                                )
 
-                        # Log position exit to Supabase
-                        self.logger.log_position_exit(
-                            market_ticker=position.ticker,
-                            exit_price=int(avg_exit_price),
-                            exit_time=int(time.time()),
-                            pnl=pnl
-                        )
+                                # Log position exit
+                                self.logger.log_position_exit(
+                                    market_ticker=position.ticker,
+                                    exit_price=int(avg_exit_price),
+                                    exit_time=int(time.time()),
+                                    pnl=pnl
+                                )
 
-                        # Log bankroll change
-                        proceeds = (avg_exit_price / 100) * total_filled
-                        self.bankroll += proceeds
-                        self.logger.log_bankroll_change(
-                            timestamp=int(time.time()),
-                            new_amount=self.bankroll,
-                            change=proceeds,
-                            description=f"Closed position: {total_filled} contracts @ {avg_exit_price}¢ (P&L: ${pnl:+.2f})"
-                        )
+                                # Log bankroll change
+                                proceeds = (avg_exit_price / 100) * total_filled
+                                self.bankroll += proceeds
+                                self.logger.log_bankroll_change(
+                                    timestamp=int(time.time()),
+                                    new_amount=self.bankroll,
+                                    change=proceeds,
+                                    description=f"Closed position: {total_filled} contracts @ {int(avg_exit_price)}¢ (P&L: ${pnl:+.2f})"
+                                )
+                            except Exception as e:
+                                logger.debug(f"Supabase log failed: {e}")
 
                         # Remove position from tracking
                         del self.positions[position_key]
@@ -854,18 +936,26 @@ class NHLTradingBot:
                         logger.info(f"⚠️  Exit order {position.exit_order_id} cancelled/expired")
                         position.exit_order_id = None  # Clear cancelled exit order
 
-                elif order_status and 'order' in order_status:
-                    order = order_status['order']
+                elif status == 'pending':
+                    # Still waiting
                     filled_count = order.get('filled_count', 0)
 
                     # Check for partial fills on exit
                     if filled_count > 0 and filled_count < order.get('count', 0):
                         logger.info(f"📊 Partial exit: {position.exit_order_id} - {filled_count}/{order.get('count')} filled")
-                        self.logger.update_order_status(
-                            order_id=position.exit_order_id,
-                            status='partially_filled',
-                            filled_size=filled_count
-                        )
+                        if self.logger:
+                            try:
+                                self.logger.update_order_status(
+                                    order_id=position.exit_order_id,
+                                    status='partially_filled',
+                                    filled_size=filled_count
+                                )
+                            except Exception as e:
+                                logger.debug(f"Supabase log failed: {e}")
+
+                else:
+                    # Cancelled/expired - clear exit_order_id for potential retry
+                    position.exit_order_id = None
 
             except Exception as e:
                 logger.error(f"Error monitoring exit order {position.exit_order_id}: {e}")
@@ -873,83 +963,89 @@ class NHLTradingBot:
     def check_exit_signals(self, game: NHLGame):
         """Check if we should exit any positions for this game."""
         for ticker in [game.away_ticker, game.home_ticker]:
-            if not ticker or ticker not in self.positions:
+            if not ticker:
                 continue
 
-            position = self.positions[ticker]
+            # Iterate over positions to find matching ticker (handle tiered keys)
+            for pos_key, position in list(self.positions.items()):
+                if position.ticker != ticker:
+                    continue
 
-            # Get current market price
-            market = self.client.get_market(ticker)
-            if not market:
-                continue
+                # Get current market price
+                market = self.client.get_market(ticker)
+                if not market:
+                    continue
 
-            current_price = market.last_price
-            time_in_position = position.time_in_position_minutes()
+                current_price = market.last_price
+                time_in_position = position.time_in_position_minutes()
 
-            # Check exit strategy
-            should_exit, reason = should_exit_position(
-                position.entry_price,
-                current_price,
-                time_in_position
-            )
+                # Check exit strategy
+                should_exit, reason = should_exit_position(
+                    position.entry_price,
+                    current_price,
+                    time_in_position
+                )
 
-            if should_exit:
-                pnl = (current_price - position.entry_price) * position.num_contracts / 100
+                if should_exit:
+                    pnl = (current_price - position.entry_price) * position.num_contracts / 100
 
-                logger.info(f"\n🚪 EXIT SIGNAL: {ticker}")
-                logger.info(f"  Entry: {position.entry_price}¢ → Current: {current_price}¢")
-                logger.info(f"  P&L: ${pnl:.2f}")
-                logger.info(f"  Reason: {reason}")
+                    logger.info(f"\n🚪 EXIT SIGNAL: {ticker}")
+                    logger.info(f"  Entry: {position.entry_price}¢ → Current: {current_price}¢")
+                    logger.info(f"  P&L: ${pnl:.2f}")
+                    logger.info(f"  Reason: {reason}")
 
-                # Place exit order
-                if not self.dry_run and position.order_id:
-                    try:
-                        exit_order = self.trading_client.place_order(
-                            ticker=ticker,
-                            action='sell',
-                            side='yes',
-                            count=position.num_contracts,
-                            price=int(current_price),
-                            order_type='limit'
-                        )
-                        logger.info(f"  ✅ Exit order placed: {exit_order.order_id}")
-
-                        # Log exit order to Supabase
-                        if self.logger:
-                            self.logger.log_order(
-                                market_ticker=ticker,
-                                order_id=exit_order.order_id,
+                    # Place exit order
+                    if not self.dry_run and position.order_id:
+                        try:
+                            exit_order = self.trading_client.place_order(
+                                market_ticker=ticker,  # FIX: market_ticker not ticker
+                                action='sell',
+                                side='yes',
+                                count=position.num_contracts,
                                 price=int(current_price),
-                                size=position.num_contracts,
-                                side='sell'
+                                order_type='limit'
                             )
+                            logger.info(f"  ✅ Exit order placed: {exit_order.order_id}")
 
-                            # Update position as closed in Supabase
-                            self.logger.log_position_exit(
-                                market_ticker=ticker,
-                                exit_price=int(current_price),
-                                exit_time=int(time.time()),
-                                pnl=pnl
-                            )
+                            # Log exit order to Supabase
+                            if self.logger:
+                                try:
+                                    self.logger.log_order(
+                                        market_ticker=ticker,
+                                        order_id=exit_order.order_id,
+                                        price=int(current_price),
+                                        size=position.num_contracts,
+                                        side='sell'
+                                    )
 
-                            # Log bankroll change
-                            proceeds = (current_price / 100) * position.num_contracts
-                            self.bankroll += proceeds
-                            self.logger.log_bankroll_change(
-                                timestamp=int(time.time()),
-                                new_amount=self.bankroll,
-                                change=proceeds,
-                                description=f"Closed position: {position.num_contracts} contracts @ {current_price}¢ (P&L: ${pnl:.2f})"
-                            )
+                                    # Update position as closed in Supabase
+                                    self.logger.log_position_exit(
+                                        market_ticker=ticker,
+                                        exit_price=int(current_price),
+                                        exit_time=int(time.time()),
+                                        pnl=pnl
+                                    )
 
-                    except Exception as e:
-                        logger.error(f"  ❌ Exit order failed: {e}")
-                        return  # Don't remove position if exit failed
-                else:
-                    logger.info(f"  [DRY RUN] Would exit position")
+                                    # Log bankroll change
+                                    proceeds = (current_price / 100) * position.num_contracts
+                                    self.bankroll += proceeds
+                                    self.logger.log_bankroll_change(
+                                        timestamp=int(time.time()),
+                                        new_amount=self.bankroll,
+                                        change=proceeds,
+                                        description=f"Closed position: {position.num_contracts} contracts @ {current_price}¢ (P&L: ${pnl:.2f})"
+                                    )
+                                except Exception as e:
+                                    logger.debug(f"Supabase log failed: {e}")
 
-                # Remove position from tracking
-                del self.positions[ticker]
+                        except Exception as e:
+                            logger.error(f"  ❌ Exit order failed: {e}")
+                            continue  # Don't remove position if exit failed
+                    else:
+                        logger.info(f"  [DRY RUN] Would exit position")
+
+                    # Remove position from tracking (using captured key)
+                    del self.positions[pos_key]
 
     def force_close_positions(self, game: NHLGame):
         """Force close all positions for a game at 90-minute window close."""
@@ -972,6 +1068,9 @@ class NHLTradingBot:
                 continue
 
             current_price = market.last_price
+            # Clamp price to valid range
+            price_cents = max(1, min(99, int(current_price)))
+
             pnl = (current_price - position.entry_price) * position.num_contracts / 100
 
             logger.info(f"\n  📤 FORCE CLOSING: {position.ticker}")
@@ -982,42 +1081,45 @@ class NHLTradingBot:
             if not self.dry_run and position.order_id:
                 try:
                     exit_order = self.trading_client.place_order(
-                        ticker=position.ticker,
+                        market_ticker=position.ticker,  # FIX: market_ticker not ticker
                         action='sell',
                         side='yes',
                         count=position.num_contracts,
-                        price=int(current_price),
+                        price=price_cents,
                         order_type='limit'
                     )
                     logger.info(f"     ✅ Exit order placed: {exit_order.order_id}")
 
                     # Log exit order to Supabase
                     if self.logger:
-                        self.logger.log_order(
-                            market_ticker=position.ticker,
-                            order_id=exit_order.order_id,
-                            price=int(current_price),
-                            size=position.num_contracts,
-                            side='sell'
-                        )
+                        try:
+                            self.logger.log_order(
+                                market_ticker=position.ticker,
+                                order_id=exit_order.order_id,
+                                price=price_cents,
+                                size=position.num_contracts,
+                                side='sell'
+                            )
 
-                        # Update position as closed in Supabase
-                        self.logger.log_position_exit(
-                            market_ticker=position.ticker,
-                            exit_price=int(current_price),
-                            exit_time=int(time.time()),
-                            pnl=pnl
-                        )
+                            # Update position as closed in Supabase
+                            self.logger.log_position_exit(
+                                market_ticker=position.ticker,
+                                exit_price=price_cents,
+                                exit_time=int(time.time()),
+                                pnl=pnl
+                            )
 
-                        # Log bankroll change
-                        proceeds = (current_price / 100) * position.num_contracts
-                        self.bankroll += proceeds
-                        self.logger.log_bankroll_change(
-                            timestamp=int(time.time()),
-                            new_amount=self.bankroll,
-                            change=proceeds,
-                            description=f"Force closed position: {position.num_contracts} contracts @ {current_price}¢ (P&L: ${pnl:.2f})"
-                        )
+                            # Log bankroll change
+                            proceeds = (current_price / 100) * position.num_contracts
+                            self.bankroll += proceeds
+                            self.logger.log_bankroll_change(
+                                timestamp=int(time.time()),
+                                new_amount=self.bankroll,
+                                change=proceeds,
+                                description=f"Force closed position: {position.num_contracts} contracts @ {current_price}¢ (P&L: ${pnl:.2f})"
+                            )
+                        except Exception as e:
+                            logger.debug(f"Supabase log failed: {e}")
 
                 except Exception as e:
                     logger.error(f"     ❌ Exit order failed: {e}")
