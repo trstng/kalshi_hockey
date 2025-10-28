@@ -659,56 +659,10 @@ class NHLTradingBot:
 
     def _place_exit_order(self, position: Position, game: NHLGame):
         """
-        Place exit order using measured move strategy.
-        Exit price = entry + (favorite_opening - entry) × revert_fraction
-
-        Args:
-            position: The position to place exit order for
-            game: The game associated with this position
+        DISABLED - DO NOT PLACE EXIT ORDERS
         """
-        if not game.favorite_opening_price:
-            logger.warning(f"  ⚠️  No favorite opening price available for {position.ticker}, cannot calculate exit price")
-            return
-
-        # Measured move formula: expect partial revert of the total drop
-        # Example: pregame 65¢, entry 45¢, revert 50% → exit = 45¢ + (65¢ - 45¢) × 50% = 55¢
-        pregame_cents = int(game.favorite_opening_price)
-        entry_cents = int(position.entry_price)
-        drop_cents = pregame_cents - entry_cents
-        expected_revert_cents = int(drop_cents * self.revert_fraction)
-        exit_price_cents = entry_cents + expected_revert_cents
-
-        logger.info(f"  → Placing measured move exit: {position.num_contracts} contracts @ {exit_price_cents}¢")
-        logger.info(f"     Formula: {entry_cents}¢ entry + {expected_revert_cents}¢ revert ({self.revert_fraction:.0%} of {drop_cents}¢ drop)")
-
-        if self.dry_run:
-            logger.info(f"    [DRY RUN] Would place exit order")
-            position.exit_order_id = f"dry_run_exit_{position.order_id}"
-            return
-
-        try:
-            exit_order = self.trading_client.place_order(
-                market_ticker=position.ticker,
-                side='yes',
-                action='sell',
-                count=position.num_contracts,
-                price=exit_price_cents,
-                order_type='limit'
-            )
-            position.exit_order_id = exit_order.order_id
-            logger.info(f"    ✅ Exit order placed: {exit_order.order_id}")
-
-            # Log exit order to Supabase
-            if self.logger:
-                self.logger.log_order(
-                    market_ticker=position.ticker,
-                    order_id=exit_order.order_id,
-                    price=exit_price_cents,
-                    size=position.num_contracts,
-                    side='sell'
-                )
-        except Exception as e:
-            logger.error(f"    ❌ Error placing exit order: {e}")
+        logger.info(f"  ⚠️  _place_exit_order() called but DISABLED - no sell orders placed")
+        return
 
     def monitor_order_fills(self):
         """
@@ -961,63 +915,11 @@ class NHLTradingBot:
                 if should_exit:
                     pnl = (current_price - position.entry_price) * position.num_contracts / 100
 
-                    logger.info(f"\n🚪 EXIT SIGNAL: {ticker}")
+                    logger.info(f"\n🚪 EXIT SIGNAL DETECTED (BUT DISABLED): {ticker}")
                     logger.info(f"  Entry: {position.entry_price}¢ → Current: {current_price}¢")
                     logger.info(f"  P&L: ${pnl:.2f}")
                     logger.info(f"  Reason: {reason}")
-
-                    # Place exit order
-                    if not self.dry_run and position.order_id:
-                        try:
-                            exit_order = self.trading_client.place_order(
-                                market_ticker=ticker,  # FIX: market_ticker not ticker
-                                action='sell',
-                                side='yes',
-                                count=position.num_contracts,
-                                price=int(current_price),
-                                order_type='limit'
-                            )
-                            logger.info(f"  ✅ Exit order placed: {exit_order.order_id}")
-
-                            # Log exit order to Supabase
-                            if self.logger:
-                                try:
-                                    self.logger.log_order(
-                                        market_ticker=ticker,
-                                        order_id=exit_order.order_id,
-                                        price=int(current_price),
-                                        size=position.num_contracts,
-                                        side='sell'
-                                    )
-
-                                    # Update position as closed in Supabase
-                                    self.logger.log_position_exit(
-                                        market_ticker=ticker,
-                                        exit_price=int(current_price),
-                                        exit_time=int(time.time()),
-                                        pnl=pnl
-                                    )
-
-                                    # Log bankroll change
-                                    proceeds = (current_price / 100) * position.num_contracts
-                                    self.bankroll += proceeds
-                                    self.logger.log_bankroll_change(
-                                        timestamp=int(time.time()),
-                                        new_amount=self.bankroll,
-                                        change=proceeds,
-                                        description=f"Closed position: {position.num_contracts} contracts @ {current_price}¢ (P&L: ${pnl:.2f})"
-                                    )
-                                except Exception as e:
-                                    logger.debug(f"Supabase log failed: {e}")
-
-                        except Exception as e:
-                            logger.error(f"  ❌ Exit order failed: {e}")
-                            continue  # Don't remove position if exit failed
-                    else:
-                        logger.info(f"  [DRY RUN] Would exit position")
-
-                    # Remove position from tracking (using captured key)
-                    del self.positions[pos_key]
+                    logger.info(f"  ⚠️  SELL ORDERS DISABLED - Manual exit required")
 
     def force_close_positions(self, game: NHLGame):
         """Force close all positions for a game at 90-minute window close."""
@@ -1040,66 +942,12 @@ class NHLTradingBot:
                 continue
 
             current_price = market.last_price
-            # Clamp price to valid range
-            price_cents = max(1, min(99, int(current_price)))
-
             pnl = (current_price - position.entry_price) * position.num_contracts / 100
 
-            logger.info(f"\n  📤 FORCE CLOSING: {position.ticker}")
+            logger.info(f"\n  📤 FORCE CLOSE SIGNAL (BUT DISABLED): {position.ticker}")
             logger.info(f"     Entry: {position.entry_price}¢ → Current: {current_price}¢")
             logger.info(f"     P&L: ${pnl:.2f}")
-
-            # Place exit order
-            if not self.dry_run and position.order_id:
-                try:
-                    exit_order = self.trading_client.place_order(
-                        market_ticker=position.ticker,  # FIX: market_ticker not ticker
-                        action='sell',
-                        side='yes',
-                        count=position.num_contracts,
-                        price=price_cents,
-                        order_type='limit'
-                    )
-                    logger.info(f"     ✅ Exit order placed: {exit_order.order_id}")
-
-                    # Log exit order to Supabase
-                    if self.logger:
-                        try:
-                            self.logger.log_order(
-                                market_ticker=position.ticker,
-                                order_id=exit_order.order_id,
-                                price=price_cents,
-                                size=position.num_contracts,
-                                side='sell'
-                            )
-
-                            # Update position as closed in Supabase
-                            self.logger.log_position_exit(
-                                market_ticker=position.ticker,
-                                exit_price=price_cents,
-                                exit_time=int(time.time()),
-                                pnl=pnl
-                            )
-
-                            # Log bankroll change
-                            proceeds = (current_price / 100) * position.num_contracts
-                            self.bankroll += proceeds
-                            self.logger.log_bankroll_change(
-                                timestamp=int(time.time()),
-                                new_amount=self.bankroll,
-                                change=proceeds,
-                                description=f"Force closed position: {position.num_contracts} contracts @ {current_price}¢ (P&L: ${pnl:.2f})"
-                            )
-                        except Exception as e:
-                            logger.debug(f"Supabase log failed: {e}")
-
-                except Exception as e:
-                    logger.error(f"     ❌ Exit order failed: {e}")
-            else:
-                logger.info(f"     [DRY RUN] Would exit position")
-
-            # Remove position
-            del self.positions[position_key]
+            logger.info(f"     ⚠️  SELL ORDERS DISABLED - Manual exit required")
 
     def run_polling_cycle(self):
         """Run one polling cycle across all games."""
