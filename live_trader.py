@@ -150,7 +150,6 @@ class NHLTradingBot:
         # Configuration from environment
         self.bankroll = float(os.getenv('TRADING_BANKROLL', 1000))
         self.max_exposure_pct = float(os.getenv('MAX_EXPOSURE_PCT', 0.5))
-        self.dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
         self.position_multiplier = float(os.getenv('POSITION_SIZE_MULTIPLIER', 1.0))
         self.revert_fraction = float(os.getenv('REVERT_FRACTION', 0.50))  # Measured move exit fraction
 
@@ -160,11 +159,10 @@ class NHLTradingBot:
         self.kalshi_markets_cache: List[dict] = []  # Cache all NHL markets at startup
 
         logger.info("="*80)
-        logger.info("NHL TRADING BOT INITIALIZED")
+        logger.info("NHL TRADING BOT INITIALIZED - LIVE MODE")
         logger.info("="*80)
         logger.info(f"Bankroll: ${self.bankroll:,.2f}")
         logger.info(f"Max Exposure: {self.max_exposure_pct:.0%}")
-        logger.info(f"Dry Run: {self.dry_run}")
         logger.info(f"Position Multiplier: {self.position_multiplier}x")
         logger.info(f"Revert Fraction: {self.revert_fraction:.0%}")
         logger.info(get_strategy_summary())
@@ -608,36 +606,33 @@ class NHLTradingBot:
 
             logger.info(f"  📝 {tier['label'].capitalize()} tier: {num_contracts} contracts @ {price}¢ (exit target: {exit_target}¢)")
 
-            # Place limit order
+            # Place limit order (ALWAYS - no dry run mode)
             order_id = None
-            if not self.dry_run:
-                try:
-                    order = self.trading_client.place_order(
+            try:
+                order = self.trading_client.place_order(
+                    market_ticker=game.favorite_ticker,
+                    action='buy',
+                    side='yes',
+                    count=num_contracts,
+                    price=price,
+                    order_type='limit'
+                )
+                order_id = order.order_id
+                logger.info(f"     ✅ Limit order placed: {order_id}")
+
+                # Log order to Supabase
+                if self.logger:
+                    self.logger.log_order(
                         market_ticker=game.favorite_ticker,
-                        action='buy',
-                        side='yes',
-                        count=num_contracts,
+                        order_id=order_id,
                         price=price,
-                        order_type='limit'
+                        size=num_contracts,
+                        side='buy'
                     )
-                    order_id = order.order_id
-                    logger.info(f"     ✅ Limit order placed: {order_id}")
 
-                    # Log order to Supabase
-                    if self.logger:
-                        self.logger.log_order(
-                            market_ticker=game.favorite_ticker,
-                            order_id=order_id,
-                            price=price,
-                            size=num_contracts,
-                            side='buy'
-                        )
-
-                except Exception as e:
-                    logger.error(f"     ❌ Order failed: {e}")
-                    continue
-            else:
-                logger.info(f"     [DRY RUN] Would place limit order")
+            except Exception as e:
+                logger.error(f"     ❌ Order failed: {e}")
+                continue
 
             # Create position (will be filled when price reaches level)
             position = Position(
