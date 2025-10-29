@@ -997,6 +997,9 @@ class NHLTradingBot:
                 current_date = datetime.now().date()
                 if current_date > last_reload_date:
                     logger.info(f"\n📅 NEW DAY: Reloading games for {current_date}")
+                    # Refresh Kalshi markets cache to discover new games
+                    self.load_kalshi_markets_cache()
+                    # Then reload today's schedule
                     self.load_todays_games()
                     last_reload_date = current_date
 
