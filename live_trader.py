@@ -2,7 +2,7 @@
 NHL Live Trading Bot - Mean Reversion Strategy
 
 Monitors NHL game markets and executes mean reversion trades:
-- Identifies favorites (≥57% at open)
+- Identifies favorites (≥59% at open)
 - Waits for dips to ≤40%
 - Enters with tiered position sizing
 - Exits at target profits or holds to outcome
@@ -30,7 +30,6 @@ from nhl_strategy import (
     should_enter_position,
     get_position_size,
     get_exit_targets,
-    should_exit_position,
     get_strategy_summary
 )
 
@@ -76,7 +75,10 @@ class NHLGame:
 
     # Volume tracking (at 30min checkpoint)
     volume_30m: Optional[int] = None
-    is_qualified: bool = False  # ≥57% favorite AND ≥50k volume
+    is_qualified: bool = False  # ≥59% favorite AND ≥50k volume
+
+    # Order tracking (pending orders that haven't filled yet)
+    pending_order_ids: List[str] = None
 
     # Checkpoints (Unix timestamps)
     poll_6h: Optional[int] = None
@@ -86,6 +88,11 @@ class NHLGame:
     # Game state
     game_started: bool = False
     monitoring_window_end: Optional[int] = None  # Puck drop + 90 minutes
+
+    def __post_init__(self):
+        """Initialize mutable default fields."""
+        if self.pending_order_ids is None:
+            self.pending_order_ids = []
 
     def get_puck_drop_timestamp(self) -> int:
         """Convert start_time_utc to Unix timestamp."""
@@ -150,7 +157,6 @@ class NHLTradingBot:
         # Configuration from environment
         self.bankroll = float(os.getenv('TRADING_BANKROLL', 1000))
         self.max_exposure_pct = float(os.getenv('MAX_EXPOSURE_PCT', 0.5))
-        self.dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
         self.position_multiplier = float(os.getenv('POSITION_SIZE_MULTIPLIER', 1.0))
         self.revert_fraction = float(os.getenv('REVERT_FRACTION', 0.50))  # Measured move exit fraction
 
@@ -164,7 +170,6 @@ class NHLTradingBot:
         logger.info("="*80)
         logger.info(f"Bankroll: ${self.bankroll:,.2f}")
         logger.info(f"Max Exposure: {self.max_exposure_pct:.0%}")
-        logger.info(f"Dry Run: {self.dry_run}")
         logger.info(f"Position Multiplier: {self.position_multiplier}x")
         logger.info(f"Revert Fraction: {self.revert_fraction:.0%}")
         logger.info(get_strategy_summary())
@@ -515,10 +520,10 @@ class NHLTradingBot:
                         timestamp=int(time.time())
                     )
 
-                # Check if favorite still qualifies (≥57%)
-                if game.favorite_opening_price >= 57.0:
+                # Check if favorite still qualifies (≥59%)
+                if game.favorite_opening_price >= 59.0:
                     # TODO: Add volume check here when API access is available
-                    # For now, assume qualified if ≥57%
+                    # For now, assume qualified if ≥59%
                     game.is_qualified = True
 
                     logger.info(f"\n[{checkpoint.upper()}] {game.away_team} @ {game.home_team}")
@@ -536,7 +541,7 @@ class NHLTradingBot:
                     self.place_tiered_limit_orders(game)
                 else:
                     logger.info(f"\n[{checkpoint.upper()}] {game.away_team} @ {game.home_team}")
-                    logger.info(f"  ❌ NOT QUALIFIED: Favorite only {game.favorite_opening_price}% (need ≥57%)")
+                    logger.info(f"  ❌ NOT QUALIFIED: Favorite only {game.favorite_opening_price}% (need ≥59%)")
 
                     # Update eligibility in Supabase
                     if self.logger:
@@ -544,9 +549,6 @@ class NHLTradingBot:
                             market_ticker=game.favorite_ticker,
                             is_eligible=False
                         )
-
-        # Check exits on open positions
-        self.check_exit_signals(game)
 
     def place_tiered_limit_orders(self, game: NHLGame):
         """
@@ -610,34 +612,31 @@ class NHLTradingBot:
 
             # Place limit order
             order_id = None
-            if not self.dry_run:
-                try:
-                    order = self.trading_client.place_order(
+            try:
+                order = self.trading_client.place_order(
+                    market_ticker=game.favorite_ticker,
+                    action='buy',
+                    side='yes',
+                    count=num_contracts,
+                    price=price,
+                    order_type='limit'
+                )
+                order_id = order.order_id
+                logger.info(f"     ✅ Limit order placed: {order_id}")
+
+                # Log order to Supabase
+                if self.logger:
+                    self.logger.log_order(
                         market_ticker=game.favorite_ticker,
-                        action='buy',
-                        side='yes',
-                        count=num_contracts,
+                        order_id=order_id,
                         price=price,
-                        order_type='limit'
+                        size=num_contracts,
+                        side='buy'
                     )
-                    order_id = order.order_id
-                    logger.info(f"     ✅ Limit order placed: {order_id}")
 
-                    # Log order to Supabase
-                    if self.logger:
-                        self.logger.log_order(
-                            market_ticker=game.favorite_ticker,
-                            order_id=order_id,
-                            price=price,
-                            size=num_contracts,
-                            side='buy'
-                        )
-
-                except Exception as e:
-                    logger.error(f"     ❌ Order failed: {e}")
-                    continue
-            else:
-                logger.info(f"     [DRY RUN] Would place limit order")
+            except Exception as e:
+                logger.error(f"     ❌ Order failed: {e}")
+                continue
 
             # Create position (will be filled when price reaches level)
             position = Position(
@@ -657,12 +656,49 @@ class NHLTradingBot:
             position_key = f"{game.favorite_ticker}_{price}"
             self.positions[position_key] = position
 
-    def _place_exit_order(self, position: Position, game: NHLGame):
+    def _place_exit_order(self, game: NHLGame, position: Position):
         """
-        DISABLED - DO NOT PLACE EXIT ORDERS
+        Place exit order using measured move strategy.
+        Exit price = entry + (opening_price - entry) * revert_fraction
+
+        The position.exit_target is already calculated at entry time, so we use that.
         """
-        logger.info(f"  ⚠️  _place_exit_order() called but DISABLED - no sell orders placed")
-        return
+        if not position.exit_target:
+            logger.warning("No exit target available for position, cannot place exit order")
+            return
+
+        exit_price_cents = position.exit_target
+
+        logger.info(f"  → Placing exit order: {position.num_contracts} contracts @ {exit_price_cents}¢")
+        logger.info(f"     Measured move: {int(position.entry_price)}¢ entry → {exit_price_cents}¢ target ({self.revert_fraction:.0%} revert)")
+
+        try:
+            exit_order = self.trading_client.place_order(
+                market_ticker=position.ticker,
+                side='yes',
+                action='sell',
+                count=position.num_contracts,
+                price=exit_price_cents,
+                order_type='limit'
+            )
+            position.exit_order_id = exit_order.order_id
+            logger.info(f"    ✓ Exit order placed: {exit_order.order_id}")
+
+            # Log to Supabase
+            if self.logger:
+                try:
+                    self.logger.log_order(
+                        market_ticker=position.ticker,
+                        order_id=exit_order.order_id,
+                        price=exit_price_cents,
+                        size=position.num_contracts,
+                        side='sell'
+                    )
+                except Exception as db_error:
+                    logger.error(f"    ✗ Failed to log exit order to Supabase: {db_error}")
+
+        except Exception as e:
+            logger.error(f"    ✗ Error placing exit order: {e}")
 
     def monitor_order_fills(self):
         """
@@ -724,8 +760,6 @@ class NHLTradingBot:
 
                 # If filled, place exit NOW using stored measured-move target
                 if (status in ('filled', 'executed') or filled_count > 0) and not position.exit_order_id:
-                    # Use precomputed measured-move target (already set at position creation)
-                    target_cents = position.exit_target
                     count = filled_count or position.num_contracts
 
                     if count > 0:
@@ -767,9 +801,18 @@ class NHLTradingBot:
                         # Update position with actual fill count
                         position.num_contracts = count
 
-                        # SELL LOGIC DISABLED - DO NOT PLACE EXIT ORDERS AUTOMATICALLY
-                        logger.info(f"ℹ️  Position opened - exit orders DISABLED (manual exit required)")
-                        logger.info(f"   Target would be: {target_cents}¢ (not placing automatically)")
+                        # IMMEDIATELY place exit order using measured-move target (bracket strategy)
+                        # Find the game for this position
+                        game = None
+                        for g in self.games.values():
+                            if g.game_id == position.game_id:
+                                game = g
+                                break
+
+                        if game:
+                            self._place_exit_order(game, position)
+                        else:
+                            logger.warning(f"   ⚠️  Game not found for position {position.ticker} - cannot place exit order")
 
                 elif status == 'pending' and filled_count > 0 and filled_count < order.get('count', 0):
                     # Partial fill
@@ -886,78 +929,14 @@ class NHLTradingBot:
             except Exception as e:
                 logger.error(f"Error monitoring exit order {position.exit_order_id}: {e}")
 
-    def check_exit_signals(self, game: NHLGame):
-        """Check if we should exit any positions for this game."""
-        for ticker in [game.away_ticker, game.home_ticker]:
-            if not ticker:
-                continue
-
-            # Iterate over positions to find matching ticker (handle tiered keys)
-            for pos_key, position in list(self.positions.items()):
-                if position.ticker != ticker:
-                    continue
-
-                # Get current market price
-                market = self.client.get_market(ticker)
-                if not market:
-                    continue
-
-                current_price = market.last_price
-                time_in_position = position.time_in_position_minutes()
-
-                # Check exit strategy
-                should_exit, reason = should_exit_position(
-                    position.entry_price,
-                    current_price,
-                    time_in_position
-                )
-
-                if should_exit:
-                    pnl = (current_price - position.entry_price) * position.num_contracts / 100
-
-                    logger.info(f"\n🚪 EXIT SIGNAL DETECTED (BUT DISABLED): {ticker}")
-                    logger.info(f"  Entry: {position.entry_price}¢ → Current: {current_price}¢")
-                    logger.info(f"  P&L: ${pnl:.2f}")
-                    logger.info(f"  Reason: {reason}")
-                    logger.info(f"  ⚠️  SELL ORDERS DISABLED - Manual exit required")
-
-    def force_close_positions(self, game: NHLGame):
-        """Force close all positions for a game at 90-minute window close."""
-        positions_to_close = []
-
-        # Find all positions for this game
-        for position_key, position in list(self.positions.items()):
-            if position.game_id == game.game_id:
-                positions_to_close.append((position_key, position))
-
-        if not positions_to_close:
-            logger.info(f"  No open positions to close")
-            return
-
-        for position_key, position in positions_to_close:
-            # Get current market price
-            market = self.client.get_market(position.ticker)
-            if not market:
-                logger.warning(f"  ⚠️  Could not fetch market for {position.ticker}")
-                continue
-
-            current_price = market.last_price
-            pnl = (current_price - position.entry_price) * position.num_contracts / 100
-
-            logger.info(f"\n  📤 FORCE CLOSE SIGNAL (BUT DISABLED): {position.ticker}")
-            logger.info(f"     Entry: {position.entry_price}¢ → Current: {current_price}¢")
-            logger.info(f"     P&L: ${pnl:.2f}")
-            logger.info(f"     ⚠️  SELL ORDERS DISABLED - Manual exit required")
-
     def run_polling_cycle(self):
         """Run one polling cycle across all games."""
         now = int(time.time())
 
         # Monitor order fills periodically (even if game hasn't started)
-        if not self.dry_run:
-            self.monitor_order_fills()
-            # Also monitor exit order fills
-            self.monitor_exit_order_fills()
+        self.monitor_order_fills()
+        # Also monitor exit order fills
+        self.monitor_exit_order_fills()
 
         for game in self.games.values():
             puck_drop = game.get_puck_drop_timestamp()
@@ -989,13 +968,10 @@ class NHLTradingBot:
                 if game.is_in_monitoring_window():
                     # Monitor order fills
                     self.monitor_order_fills()
-
-                    # Check exits for this game's positions
-                    self.check_exit_signals(game)
                 elif game.monitoring_window_end and now >= game.monitoring_window_end:
-                    # Force close any remaining positions at window close
+                    # Window closed - exit orders already placed via bracket strategy
                     logger.info(f"\n⏰ WINDOW CLOSED: {game.away_team} @ {game.home_team}")
-                    self.force_close_positions(game)
+                    logger.info(f"   Exit orders already in place via measured-move strategy")
 
     def run(self):
         """Main bot loop."""
