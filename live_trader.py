@@ -966,8 +966,8 @@ class NHLTradingBot:
             # Monitor positions during the 90-minute window
             if game.game_started and game.is_qualified:
                 if game.is_in_monitoring_window():
-                    # Monitor order fills
-                    self.monitor_order_fills()
+                    # Monitoring happens at line 937 for ALL games (no need to call again here)
+                    pass
                 elif game.monitoring_window_end and now >= game.monitoring_window_end:
                     # Window closed - exit orders already placed via bracket strategy
                     logger.info(f"\n⏰ WINDOW CLOSED: {game.away_team} @ {game.home_team}")
