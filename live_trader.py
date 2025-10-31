@@ -901,9 +901,9 @@ class NHLTradingBot:
                         del self.positions[position_key]
 
                     else:
-                        # Exit order was cancelled
-                        logger.info(f"⚠️  Exit order {position.exit_order_id} cancelled/expired")
-                        position.exit_order_id = None  # Clear cancelled exit order
+                        # Exit order was cancelled - keep exit_order_id to prevent duplicate placement
+                        logger.info(f"⚠️  Exit order {position.exit_order_id} cancelled/expired - keeping ID to prevent re-placement")
+                        # DO NOT clear exit_order_id - would cause duplicate exit orders every cycle
 
                 elif status == 'pending':
                     # Still waiting
@@ -923,8 +923,9 @@ class NHLTradingBot:
                                 logger.debug(f"Supabase log failed: {e}")
 
                 else:
-                    # Cancelled/expired - clear exit_order_id for potential retry
-                    position.exit_order_id = None
+                    # Cancelled/expired - keep exit_order_id to prevent duplicate placement
+                    logger.info(f"⚠️  Exit order {position.exit_order_id} in unexpected state ({status}) - keeping ID to prevent re-placement")
+                    # DO NOT clear exit_order_id - would cause duplicate exit orders every cycle
 
             except Exception as e:
                 logger.error(f"Error monitoring exit order {position.exit_order_id}: {e}")
